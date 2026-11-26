@@ -118,10 +118,25 @@ def app_mode():
                     if bg_state["size"] == (w, h):
                         return
                     bg_state["size"] = (w, h)
-                    r = max(w / bg_src.width, h / bg_src.height)          # cover the window, crop the rest
-                    im = bg_src.resize((int(bg_src.width * r) + 1, int(bg_src.height * r) + 1))
-                    l, t = (im.width - w) // 2, (im.height - h) // 2
-                    im.crop((l, t, l + w, t + h)).save(bg_cache)
+                    mode = store.settings.get("bg_mode", "fill")
+                    if mode == "stretch":
+                        out = bg_src.resize((w, h))
+                    elif mode in ("fit", "center"):
+                        out = Image.new("RGB", (w, h), BG)
+                        r = min(w / bg_src.width, h / bg_src.height) if mode == "fit" else min(1.0, w / bg_src.width, h / bg_src.height)
+                        im = bg_src.resize((max(1, int(bg_src.width * r)), max(1, int(bg_src.height * r))))
+                        out.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
+                    elif mode == "tile":
+                        out = Image.new("RGB", (w, h), BG)
+                        for y in range(0, h, bg_src.height):
+                            for x in range(0, w, bg_src.width):
+                                out.paste(bg_src, (x, y))
+                    else:                                                     # fill: cover the window, crop the rest
+                        r = max(w / bg_src.width, h / bg_src.height)
+                        im = bg_src.resize((int(bg_src.width * r) + 1, int(bg_src.height * r) + 1))
+                        l, t = (im.width - w) // 2, (im.height - h) // 2
+                        out = im.crop((l, t, l + w, t + h))
+                    out.save(bg_cache)
                     bg_label.img = tk.PhotoImage(file=bg_cache)            # Tk reads PNG itself
                     bg_label.configure(image=bg_label.img)
                     bg_label.lower()
@@ -138,6 +153,12 @@ def app_mode():
         except Exception as e:
             bg_label = None
             log(f"background picture failed: {e}")
+
+    root.attributes("-topmost", bool(store.settings.get("on_top")))
+    try:
+        root.iconbitmap(default=os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icon.ico"))
+    except Exception:
+        pass
 
     FILL = "none" if bg_label else "x"     # with a picture, rows only take the space they need so it shows through
 
@@ -435,9 +456,10 @@ def app_mode():
 
     def look_dialog():
         from tkinter import colorchooser
-        d = popup("Look", "460x470")
+        d = popup("Look", "500x540")
         s = store.settings
-        new = {k: s.get(k) for k in ("bg_color", "btn_color", "bg_image", "alpha", "show_log")}
+        new = {k: s.get(k) for k in ("bg_color", "btn_color", "bg_image", "alpha", "show_log", "bg_mode")}
+        new["bg_mode"] = new["bg_mode"] or "fill"
 
         def color_row(text, key):
             row = tk.Frame(d, bg=BG)
@@ -487,6 +509,17 @@ def app_mode():
         btn(prow, "Choose picture", choose).pack(side="left")
         btn(prow, "Remove", clear).pack(side="left", padx=4)
 
+        mrow = tk.Frame(d, bg=BG)
+        mrow.pack(anchor="w", padx=10, pady=(2, 0))
+        lbl(mrow, "picture size: ").pack(side="left")
+        mode_var = tk.StringVar(value=new["bg_mode"])
+        mm = tk.OptionMenu(mrow, mode_var, "fill", "fit", "stretch", "center", "tile")
+        mm.configure(bg=BTN, fg=T["fg"], activebackground=DIM, activeforeground=T["fg"], relief="solid", bd=1,
+                     font=FONT, highlightthickness=0)
+        mm["menu"].configure(bg=BTN, fg="#FFFFFF", font=FONT)
+        mm.pack(side="left")
+        lbl(d, "fill = covers the window   fit = whole picture   tile = repeat a small one", fg=DIM).pack(anchor="w", padx=10)
+
         lbl(d, "-- window --", fg=DIM).pack(anchor="w", padx=10, pady=(12, 0))
         lbl(d, "see-through (100 = solid)").pack(anchor="w", padx=10)
         op = tk.Scale(d, from_=40, to=100, orient="horizontal", bg=BG, fg=T["fg"], troughcolor=BTN,
@@ -501,7 +534,8 @@ def app_mode():
         def save():
             new["alpha"] = int(op.get()) / 100
             new["show_log"] = bool(sl.get())
-            changed = any(new[k] != s.get(k) for k in ("bg_color", "btn_color", "bg_image", "show_log"))
+            new["bg_mode"] = mode_var.get()
+            changed = any(new[k] != s.get(k) for k in ("bg_color", "btn_color", "bg_image", "show_log", "bg_mode"))
             s.update(new)
             store.save()
             d.destroy()
@@ -511,6 +545,7 @@ def app_mode():
 
         def reset():
             new.update(bg_color="#000000", btn_color="#1A1A1A", bg_image="", alpha=1.0, show_log=True)
+            mode_var.set("fill")
             op.set(100)
             sl.set(1)
             save()
@@ -615,7 +650,11 @@ def app_mode():
     btn(logbar, "clear", clear_log).pack(side="right")
     log_box = tk.Text(root, bg=BG, fg=DIM, font=FONT, relief="solid", bd=1, height=12,
                       highlightthickness=0, state="disabled")
-    log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    if bg_label:
+        log_box.configure(height=8, width=78)
+        log_box.pack(anchor="w", padx=10, pady=(0, 10))
+    else:
+        log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
     if not store.settings.get("show_log", True):
         logbar.pack_forget()
         log_box.pack_forget()
