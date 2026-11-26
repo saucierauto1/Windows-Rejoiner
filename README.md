@@ -1,6 +1,6 @@
 # NovaHop Rejoin for Windows
 
-Keeps your Roblox accounts farming with NovaHop. When an account gets an error screen (279, kicks, key system),
+Keeps your Roblox accounts farming with NovaHop. When an account gets an error screen (279, kicks, ),
 freezes, or its Roblox window closes, only that account is closed and launched back into the game.
 Several accounts at once, no clone setup.
 
