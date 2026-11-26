@@ -104,6 +104,10 @@ class Store:
         self.settings.setdefault("ps_raw", "")
         self.settings.setdefault("launch_delay", 12)
         self.settings.setdefault("hb_dirs", [])
+        for k, v in (("error_wait", ERROR_WAIT), ("stale", STALE), ("webhook", ""), ("wh_ping", ""),
+                     ("wh_restart", True), ("wh_stuck", True), ("wh_login", True), ("wh_startstop", False),
+                     ("autostart", False), ("on_top", False), ("text_color", "#FFFFFF")):
+            self.settings.setdefault(k, v)
 
     def save(self):
         with self.lock:
@@ -241,6 +245,18 @@ def launch_uri(ticket, tracker, place, link_code=""):
             + "+placelauncherurl:" + urllib.parse.quote(launcher, safe="")
             + "+browsertrackerid:" + tracker
             + "+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp")
+
+
+# ------------------------------------------------------------------ Discord webhook
+def is_webhook(url):
+    return bool(re.match(r"^https://(ptb\.|canary\.)?discord(app)?\.com/api/webhooks/\d+/[\w-]+$", (url or "").strip()))
+
+
+def send_webhook(url, text):
+    data = json.dumps({"content": text[:1900], "username": "NovaHop Rejoin"}).encode()
+    req = urllib.request.Request(url.strip(), data=data, method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "NovaHopRejoin/1.0"})
+    urllib.request.urlopen(req, timeout=10).close()
 
 
 # ------------------------------------------------------------------ several Roblox windows at once
@@ -407,9 +423,11 @@ class Watcher:
         self.alive = False
         self.queue.clear()
         self.log("Watcher stopped")
+        self.notify("startstop", "Watcher stopped")
 
     def _run(self):
         self.log("Watcher started")
+        self.notify("startstop", f"Watcher started ({len(self.store.accounts)} accounts)")
         if not self.store.settings["hb_dirs"]:
             self.rescan()
         while self.alive:
@@ -465,6 +483,7 @@ class Watcher:
         except LoginExpired:
             self.status[uid] = "login expired, log in again"
             self.log(f"{a['name']}: login expired. Remove the account and add it again.")
+            self.notify("login", f"**{a['name']}**: login expired, log in again in the app")
             a["enabled"] = False
             self.store.save()
             return
@@ -497,12 +516,29 @@ class Watcher:
                 self.pids[a["uid"]] = new[0]
                 return
 
+    def notify(self, kind, text):
+        s = self.store.settings
+        url = s.get("webhook", "")
+        if not is_webhook(url) or not s.get("wh_" + kind, True):
+            return
+        ping = s.get("wh_ping", "").strip()
+        if ping and kind in ("stuck", "login"):
+            text = f"<@{ping}> " + text
+
+        def go():
+            try:
+                send_webhook(url, text)
+            except Exception as e:
+                self.log(f"Discord webhook failed: {e}")
+        threading.Thread(target=go, daemon=True).start()
+
     def restart(self, a, pid, why):
         uid = a["uid"]
         if pid:
             self.kill(pid)
         self.pids.pop(uid, None)
         self.restarts[uid] = self.restarts.get(uid, 0) + 1
+        self.notify("restart", f"Restarting **{a['name']}**: {why} (restart #{self.restarts[uid]})")
         self.want_launch(a, why)
 
     def want_launch(self, a, why):
@@ -521,6 +557,8 @@ class Watcher:
     def tick(self):
         now = self.now()
         procs = self.procs()
+        err_wait = int(self.store.settings.get("error_wait", ERROR_WAIT))
+        stale = int(self.store.settings.get("stale", STALE))
         beats = read_heartbeats(self.store.settings["hb_dirs"])
         for a in list(self.store.accounts):
             uid = a["uid"]
@@ -553,6 +591,8 @@ class Watcher:
                 if f >= 3 and now - last < RETRY:
                     self.status[uid] = "not coming back, retrying every 15 min"
                     continue
+                if f == 2:
+                    self.notify("stuck", f"**{a['name']}** keeps closing after 3 relaunches. Check that PC.")
                 self.fails[uid] = f + 1
                 self.restart(a, None, "Roblox window closed")
                 continue
@@ -564,23 +604,24 @@ class Watcher:
                     self.fails[uid] = 0
                 continue
 
-            if hb and age < STALE and hb[1] == "error":
+            if hb and age < stale and hb[1] == "error":
                 self.status[uid] = "error: " + hb[2]
                 if not self.err_since.get(uid):
                     self.err_since[uid] = now
                     self.log(f"{a['name']}: error on screen: {hb[2]}")
-                if now - self.err_since[uid] >= ERROR_WAIT:
+                if now - self.err_since[uid] >= err_wait:
                     self.restart(a, pid, f"error screen ({hb[2]})")
                 continue
             if self.err_since.get(uid):
                 self.log(f"{a['name']}: error cleared")
             self.err_since[uid] = 0
 
-            if hb is None or age >= STALE:
+            if hb is None or age >= stale:
                 if f >= 3 and last and now - last < RETRY:
                     self.status[uid] = "not coming back, retrying every 15 min"
                     continue
                 if f == 2:
+                    self.notify("stuck", f"**{a['name']}** didn't come back after 3 restarts. Check that PC.")
                     self.log(f"{a['name']} didn't come back after 3 restarts. Is the heartbeat in the executor's "
                              "autoexec, and is the executor attaching? Retrying every 15 min.")
                 self.fails[uid] = f + 1

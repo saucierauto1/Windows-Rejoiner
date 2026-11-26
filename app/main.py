@@ -18,7 +18,7 @@ import core
 def login_mode(out_file):
     import webview
 
-    w = webview.create_window("Log in to Roblox  ·  NovaHop Rejoin", "https://www.roblox.com/login",
+    w = webview.create_window("Log in to Roblox - roblox.com", "https://www.roblox.com/login",
                               width=520, height=760)
 
     def wait_for_login():
@@ -47,8 +47,10 @@ def app_mode():
 
     BG = "#000000"; FG = "#FFFFFF"; DIM = "#888888"; BTN = "#1A1A1A"
     FONT = ("Consolas", 10)
+    DISCORD = "https://discord.gg/brfJ2ZtegE"
 
     store = core.Store()
+    T = {"fg": store.settings.get("text_color", "#FFFFFF")}
     lines = []
     lock = threading.Lock()
     count = [0]
@@ -65,20 +67,21 @@ def app_mode():
     root.title("NovaHop Rejoin")
     root.geometry("640x620")
     root.configure(bg=BG)
+    root.attributes("-topmost", bool(store.settings.get("on_top")))
     try:
         root.iconbitmap(os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(__file__)), "icon.ico"))
     except Exception:
         pass
 
     def btn(parent, text, cmd, width=None):
-        b = tk.Button(parent, text=text, command=cmd, bg=BTN, fg=FG, activebackground="#333333",
-                      activeforeground=FG, relief="solid", bd=1, font=FONT, padx=8, pady=3)
+        b = tk.Button(parent, text=text, command=cmd, bg=BTN, fg=T["fg"], activebackground="#333333",
+                      activeforeground=T["fg"], relief="solid", bd=1, font=FONT, padx=8, pady=3)
         if width:
             b.configure(width=width)
         return b
 
-    def lbl(parent, text="", fg=FG, **kw):
-        return tk.Label(parent, text=text, bg=BG, fg=fg, font=FONT, anchor="w", justify="left", **kw)
+    def lbl(parent, text="", fg=None, **kw):
+        return tk.Label(parent, text=text, bg=BG, fg=fg or T["fg"], font=FONT, anchor="w", justify="left", **kw)
 
     top = tk.Frame(root, bg=BG)
     top.pack(fill="x", padx=10, pady=(10, 4))
@@ -152,7 +155,7 @@ def app_mode():
 
         def field(text, value):
             lbl(d, text).pack(anchor="w", padx=10, pady=(8, 0))
-            e = tk.Entry(d, bg=BG, fg=FG, insertbackground=FG, relief="solid", bd=1, font=FONT)
+            e = tk.Entry(d, bg="#FFFFFF", fg="#000000", insertbackground="#000000", relief="solid", bd=1, font=FONT)
             e.pack(fill="x", padx=10)
             e.insert(0, value)
             return e
@@ -232,6 +235,107 @@ def app_mode():
         draw()
 
     btn(bar, "Folders", folders_dialog).pack(side="left", padx=4)
+    btn(bar, "Settings", lambda: settings_dialog()).pack(side="left", padx=4)
+    btn(bar, "Discord", lambda: __import__("webbrowser").open(DISCORD)).pack(side="left", padx=4)
+
+
+    # ---------------- settings
+    COLORS = {"white": "#FFFFFF", "green": "#00FF00", "cyan": "#00FFFF", "pink": "#FF77FF",
+              "orange": "#FFA500", "purple": "#B388FF", "yellow": "#FFFF66"}
+
+    def recolor(widget, old, new):
+        for w in widget.winfo_children():
+            try:
+                if str(w.cget("fg")).upper() == old.upper():
+                    w.configure(fg=new)
+                if isinstance(w, tk.Button):
+                    w.configure(activeforeground=new)
+            except tk.TclError:
+                pass
+            recolor(w, old, new)
+
+    def settings_dialog():
+        d = popup("Settings", "500x720")
+        s = store.settings
+
+        def head(t):
+            lbl(d, t, fg=DIM).pack(anchor="w", padx=10, pady=(12, 0))
+
+        def entry(t, v):
+            lbl(d, t).pack(anchor="w", padx=10, pady=(4, 0))
+            e = tk.Entry(d, bg="#FFFFFF", fg="#000000", insertbackground="#000000", relief="solid", bd=1, font=FONT)
+            e.pack(fill="x", padx=10)
+            e.insert(0, str(v))
+            return e
+
+        def check(t, key):
+            v = tk.IntVar(value=1 if s.get(key) else 0)
+            tk.Checkbutton(d, text=t, variable=v, bg=BG, fg=T["fg"], activebackground=BG, activeforeground=T["fg"],
+                           selectcolor=BG, font=FONT, anchor="w").pack(anchor="w", padx=6)
+            return key, v
+
+        head("-- discord webhook --")
+        wh = entry("webhook url", s.get("webhook", ""))
+        ping = entry("ping user id on problems (optional)", s.get("wh_ping", ""))
+        checks = [check("message on every restart", "wh_restart"),
+                  check("message when an account is stuck", "wh_stuck"),
+                  check("message when a login expires", "wh_login"),
+                  check("message on start / stop", "wh_startstop")]
+
+        def test():
+            url = wh.get().strip()
+            if not core.is_webhook(url):
+                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=d)
+                return
+            try:
+                core.send_webhook(url, "NovaHop Rejoin test message")
+                messagebox.showinfo("NovaHop Rejoin", "sent, check your discord", parent=d)
+            except Exception as e:
+                messagebox.showerror("NovaHop Rejoin", f"failed: {e}", parent=d)
+        btn(d, "Test webhook", test).pack(anchor="w", padx=10, pady=4)
+
+        head("-- app --")
+        checks += [check("start watching when the app opens", "autostart"),
+                   check("keep window on top", "on_top")]
+        lbl(d, "text colour").pack(anchor="w", padx=10, pady=(4, 0))
+        cur = next((k for k, v in COLORS.items() if v.upper() == T["fg"].upper()), "white")
+        col = tk.StringVar(value=cur)
+        om = tk.OptionMenu(d, col, *COLORS)
+        om.configure(bg=BTN, fg=T["fg"], activebackground="#333333", activeforeground=T["fg"], relief="solid", bd=1,
+                     font=FONT, highlightthickness=0)
+        om["menu"].configure(bg=BTN, fg="#FFFFFF", font=FONT)
+        om.pack(anchor="w", padx=10)
+
+        head("-- restart timing (seconds) --")
+        ew = entry("restart after an error screen stays up", s.get("error_wait", core.ERROR_WAIT))
+        st = entry("restart after no heartbeat for", s.get("stale", core.STALE))
+
+        def save():
+            url = wh.get().strip()
+            if url and not core.is_webhook(url):
+                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=d)
+                return
+            try:
+                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get()))
+            except ValueError:
+                messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=d)
+                return
+            s.update(webhook=url, wh_ping=ping.get().strip(), error_wait=e_w, stale=s_t)
+            for key, v in checks:
+                s[key] = bool(v.get())
+            new = COLORS[col.get()]
+            if new.upper() != T["fg"].upper():
+                old = T["fg"]
+                T["fg"] = new
+                s["text_color"] = new
+                recolor(root, old, new)
+                rows_key[0] = None
+            root.attributes("-topmost", bool(s.get("on_top")))
+            store.save()
+            log("settings saved")
+            d.destroy()
+
+        btn(d, "Save", save).pack(anchor="w", padx=10, pady=12)
 
     # ---------------- accounts
     lbl(root, "accounts:").pack(anchor="w", padx=10, pady=(10, 0))
@@ -243,6 +347,15 @@ def app_mode():
     def remove(a):
         if messagebox.askyesno("NovaHop Rejoin", f"remove {a['name']}? its saved login gets deleted"):
             store.remove(a["uid"])
+
+    def rename(a):
+        from tkinter import simpledialog
+        n = simpledialog.askstring("Rename", f"nickname for {a['name']} (empty = username)",
+                                   initialvalue=a.get("nick", ""), parent=root)
+        if n is not None:
+            a["nick"] = n.strip()
+            store.save()
+            rows_key[0] = None
 
     def set_enabled(a, var):
         a["enabled"] = bool(var.get())
@@ -258,17 +371,26 @@ def app_mode():
             r = tk.Frame(acc_box, bg=BG)
             r.pack(fill="x", pady=1)
             var = tk.IntVar(value=1 if a.get("enabled", True) else 0)
-            tk.Checkbutton(r, variable=var, bg=BG, activebackground=BG, selectcolor=BG, fg=FG,
+            tk.Checkbutton(r, variable=var, bg=BG, activebackground=BG, selectcolor=BG, fg=T["fg"],
                            command=lambda a=a, v=var: set_enabled(a, v)).pack(side="left")
-            name = lbl(r, a["name"], width=18)
+            name = lbl(r, a.get("nick") or a["name"], width=18)
             name.pack(side="left")
+            name.bind("<Double-Button-1>", lambda e, a=a: rename(a))
             st = lbl(r, "", width=34)
             st.pack(side="left")
             btn(r, "x", lambda a=a: remove(a)).pack(side="right")
             btn(r, "Relaunch", lambda u=a["uid"]: watcher.launch_now(u)).pack(side="right", padx=4)
             rows[a["uid"]] = st
 
-    lbl(root, "log:").pack(anchor="w", padx=10, pady=(10, 0))
+    logbar = tk.Frame(root, bg=BG)
+    logbar.pack(fill="x", padx=10, pady=(10, 0))
+    lbl(logbar, "log:").pack(side="left")
+
+    def clear_log():
+        log_box.configure(state="normal")
+        log_box.delete("1.0", "end")
+        log_box.configure(state="disabled")
+    btn(logbar, "clear", clear_log).pack(side="right")
     log_box = tk.Text(root, bg=BG, fg=DIM, font=FONT, relief="solid", bd=1, height=12,
                       highlightthickness=0, state="disabled")
     log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -320,6 +442,8 @@ def app_mode():
         root.after(1000, tick)
 
     log("ready. close all roblox windows before pressing start")
+    if store.settings.get("autostart") and store.accounts:
+        root.after(1500, toggle)
     tick()
     root.mainloop()
 
