@@ -13,6 +13,7 @@ import threading
 import time
 
 import core
+import mouselock
 
 
 # ------------------------------------------------------------------ login window (child process)
@@ -85,6 +86,7 @@ def app_mode():
             del lines[:-300]
 
     watcher = core.Watcher(store, log)
+    mlock = mouselock.MouseLock(log)
 
     root = tk.Tk()
     root.title("NovaHop Rejoin")
@@ -318,7 +320,16 @@ def app_mode():
             recolor(w, old, new)
 
     def settings_dialog():
-        d = popup("Settings", "520x1000")
+        win = popup("Settings", "540x760")
+        sc = tk.Canvas(win, bg=BG, highlightthickness=0)
+        bar_ = tk.Scrollbar(win, orient="vertical", command=sc.yview)
+        sc.configure(yscrollcommand=bar_.set)
+        bar_.pack(side="right", fill="y")
+        sc.pack(side="left", fill="both", expand=True)
+        d = tk.Frame(sc, bg=BG)
+        sc.create_window(0, 0, window=d, anchor="nw")
+        d.bind("<Configure>", lambda e: sc.configure(scrollregion=sc.bbox("all")))
+        win.bind("<MouseWheel>", lambda e: sc.yview_scroll(int(-e.delta / 120), "units"))
         s = store.settings
 
         def head(t):
@@ -347,16 +358,20 @@ def app_mode():
                   check("live status message (accounts, ram, cpu)", "wh_status")]
         every = entry("update the status every (seconds, min 30)", s.get("status_every", 60))
 
+        head("-- mouse lock --")
+        checks += [check("hotkey locks the mouse to the monitor it's on", "mouse_lock")]
+        mk = entry("hotkey (e.g. ctrl+alt+l, f8, ctrl+shift+m)", s.get("mouse_key", "ctrl+alt+l"))
+
         def test():
             url = wh.get().strip()
             if not core.is_webhook(url):
-                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=d)
+                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=win)
                 return
             try:
                 core.send_webhook(url, "NovaHop Rejoin test message")
-                messagebox.showinfo("NovaHop Rejoin", "sent, check your discord", parent=d)
+                messagebox.showinfo("NovaHop Rejoin", "sent, check your discord", parent=win)
             except Exception as e:
-                messagebox.showerror("NovaHop Rejoin", f"failed: {e}", parent=d)
+                messagebox.showerror("NovaHop Rejoin", f"failed: {e}", parent=win)
         btn(d, "Test webhook", test).pack(anchor="w", padx=10, pady=4)
 
         head("-- app --")
@@ -383,14 +398,18 @@ def app_mode():
         def save():
             url = wh.get().strip()
             if url and not core.is_webhook(url):
-                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=d)
+                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=win)
                 return
             try:
                 e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["boot_wait"] = max(60, int(bw.get())); s["hop_wait"] = max(10, int(hw.get())); s["status_every"] = max(30, int(every.get()))
             except ValueError:
-                messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=d)
+                messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=win)
                 return
-            s.update(webhook=url, wh_ping=ping.get().strip(), error_wait=e_w, stale=s_t)
+            key = mk.get().strip().lower()
+            if not mouselock.parse_hotkey(key):
+                messagebox.showerror("NovaHop Rejoin", "didn't understand that hotkey. use something like ctrl+alt+l or f8", parent=win)
+                return
+            s.update(webhook=url, wh_ping=ping.get().strip(), error_wait=e_w, stale=s_t, mouse_key=key)
             for key, v in checks:
                 s[key] = bool(v.get())
             new = COLORS[col.get()]
@@ -402,8 +421,13 @@ def app_mode():
                 rows_key[0] = None
             root.attributes("-topmost", bool(s.get("on_top")))
             store.save()
+            if s.get("mouse_lock"):
+                mlock.start(s["mouse_key"])
+            else:
+                mlock.stop_hotkey()
+                mlock.unlock()
             log("settings saved")
-            d.destroy()
+            win.destroy()
 
         btn(d, "Save", save).pack(anchor="w", padx=10, pady=12)
 
@@ -675,7 +699,8 @@ def app_mode():
             start_btn.configure(text="Stop" if on else "Start")
         s = store.settings
         game = "bee swarm" if s["place"] == core.BEE_SWARM else f"place {s['place']}"
-        set_text("info", f"{game} | {'private server' if s.get('ps_raw') else 'public'} | {len(s['hb_dirs'])} hb folder(s)")
+        set_text("info", f"{game} | {'private server' if s.get('ps_raw') else 'public'} | {len(s['hb_dirs'])} hb folder(s)"
+                         + (f" | mouse locked ({s.get('mouse_key')} to free)" if mlock.locked else ""))
         for a in store.accounts:
             tag = rows.get(a["uid"])
             if tag is None:
@@ -751,6 +776,7 @@ def app_mode():
     icon_file = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icon.ico")
 
     def quit_app():
+        mlock.unlock()
         if tray["icon"]:
             try:
                 tray["icon"].stop()
@@ -794,6 +820,9 @@ def app_mode():
         if e.widget is root and root.state() == "iconic" and store.settings.get("tray", True) and not tray["icon"]:
             root.after(10, to_tray)
     root.bind("<Unmap>", on_unmap, add="+")
+    root.protocol("WM_DELETE_WINDOW", quit_app)     # always free the mouse when closing
+    if store.settings.get("mouse_lock"):
+        mlock.start(store.settings.get("mouse_key", "ctrl+alt+l"))
 
     # ---------------- update check
     VERSION_FILE = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "version.txt")

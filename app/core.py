@@ -113,6 +113,7 @@ class Store:
                      ("wh_status", True), ("status_every", 60), ("shots", True), ("status_msg", ""),
                      ("bg_color", "#000000"), ("btn_color", "#1A1A1A"), ("bg_image", ""), ("alpha", 1.0),
                      ("show_log", True), ("tray", True), ("update_check", True), ("launch_min", False), ("hop_wait", HOP_WAIT),
+                     ("mouse_lock", False), ("mouse_key", "ctrl+alt+l"),
                      ("boot_wait", BOOT_WAIT)):
             self.settings.setdefault(k, v)
 
