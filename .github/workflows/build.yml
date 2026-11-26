@@ -15,9 +15,12 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt pyinstaller==6.11.1
       - name: Check the code loads
-        run: python -c "import sys; sys.path.insert(0, 'app'); import core, main, customtkinter, webview, psutil; print('ok')"
+        run: python -c "import sys; sys.path.insert(0, 'app'); import core, main, webview, psutil, PIL, pystray; print('ok')"
+      - name: Save the version number
+        shell: bash
+        run: echo "${{ github.run_number }}" > app/version.txt
       - name: Build NovaHopRejoin.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name NovaHopRejoin --icon app/icon.ico --add-data "app/icon.ico;." --collect-all customtkinter --collect-all webview app/main.py
+        run: pyinstaller --noconfirm --onefile --windowed --name NovaHopRejoin --icon app/icon.ico --add-data "app/icon.ico;." --add-data "app/version.txt;." --hidden-import pystray._win32 --hidden-import PIL.ImageTk --hidden-import PIL.ImageGrab --collect-all webview app/main.py
       - uses: actions/upload-artifact@v4
         with:
           name: NovaHopRejoin
