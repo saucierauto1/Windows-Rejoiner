@@ -4,6 +4,7 @@ Run with no arguments for the app. "--login <file>" opens the Roblox login windo
 "Add account"; it runs as its own process because the browser window needs the main thread).
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -21,20 +22,40 @@ def login_mode(out_file):
     w = webview.create_window("Log in to Roblox - roblox.com", "https://www.roblox.com/login",
                               width=520, height=760)
 
+    READ_USER = ("(function(){var m=document.querySelector('meta[name=\"user-data\"]');"
+                 "return m?JSON.stringify({id:m.getAttribute('data-userid'),name:m.getAttribute('data-name'),"
+                 "display:m.getAttribute('data-displayname')}):null})()")
+
     def wait_for_login():
+        cookie, since = None, 0
         while True:
-            time.sleep(1.2)
+            time.sleep(1.0)
             try:
-                cookies = w.get_cookies() or []
+                for c in w.get_cookies() or []:
+                    for key, morsel in c.items():
+                        if key == ".ROBLOSECURITY" and morsel.value:
+                            if morsel.value != cookie:
+                                cookie, since = morsel.value, time.time()
+                if not cookie:
+                    continue
+                url = w.get_current_url() or ""
+                # wait until Roblox has finished logging in and shows a normal page, then read who it is
+                if "/login" in url or "/challenge" in url:
+                    continue
+                user = None
+                try:
+                    raw = w.evaluate_js(READ_USER)
+                    user = json.loads(raw) if raw else None
+                except Exception:
+                    user = None
+                if not (user and user.get("id")) and time.time() - since < 15:
+                    continue
+                with open(out_file, "w", encoding="utf-8") as f:
+                    json.dump({"cookie": core.protect(cookie), "user": user or {}}, f)   # encrypted on disk
+                w.destroy()
+                return
             except Exception:
                 continue
-            for c in cookies:
-                for key, morsel in c.items():
-                    if key == ".ROBLOSECURITY" and morsel.value:
-                        with open(out_file, "w", encoding="utf-8") as f:
-                            f.write(core.protect(morsel.value))   # encrypted before it touches the disk
-                        w.destroy()
-                        return
 
     webview.start(wait_for_login, private_mode=True)   # private: every login starts logged out
     os._exit(0)
@@ -77,39 +98,46 @@ def app_mode():
     # background picture, stretched to fill the window behind everything
     bg_label = None
     bg_path = store.settings.get("bg_image", "")
-    if bg_path and os.path.exists(bg_path):
+    if bg_path and not os.path.exists(bg_path):
+        log(f"background picture is missing ({bg_path}), pick it again in Look")
+    elif bg_path:
         try:
-            from PIL import Image, ImageTk
+            from PIL import Image
             bg_src = Image.open(bg_path).convert("RGB")
+            bg_cache = os.path.join(core.DATA_DIR, "background_fit.png")
             bg_label = tk.Label(root, bd=0, bg=BG)
             bg_label.place(x=0, y=0, relwidth=1, relheight=1)
             bg_state = {"size": None, "job": None}
 
-            def fit_bg(_=None):
-                w, h = max(root.winfo_width(), 50), max(root.winfo_height(), 50)
-                if bg_state["size"] == (w, h):
-                    return
-                bg_state["size"] = (w, h)
-                r = max(w / bg_src.width, h / bg_src.height)          # cover the window, crop the rest
-                im = bg_src.resize((int(bg_src.width * r) + 1, int(bg_src.height * r) + 1))
-                l, t = (im.width - w) // 2, (im.height - h) // 2
-                bg_label.img = ImageTk.PhotoImage(im.crop((l, t, l + w, t + h)))
-                bg_label.configure(image=bg_label.img)
+            def fit_bg():
+                try:
+                    w, h = root.winfo_width(), root.winfo_height()
+                    if w < 50 or h < 50:
+                        root.after(200, fit_bg)
+                        return
+                    if bg_state["size"] == (w, h):
+                        return
+                    bg_state["size"] = (w, h)
+                    r = max(w / bg_src.width, h / bg_src.height)          # cover the window, crop the rest
+                    im = bg_src.resize((int(bg_src.width * r) + 1, int(bg_src.height * r) + 1))
+                    l, t = (im.width - w) // 2, (im.height - h) // 2
+                    im.crop((l, t, l + w, t + h)).save(bg_cache)
+                    bg_label.img = tk.PhotoImage(file=bg_cache)            # Tk reads PNG itself
+                    bg_label.configure(image=bg_label.img)
+                    bg_label.lower()
+                except Exception as e:
+                    log(f"background picture failed: {e}")
 
             def on_resize(e):
                 if e.widget is root:
                     if bg_state["job"]:
                         root.after_cancel(bg_state["job"])
-                    bg_state["job"] = root.after(120, fit_bg)
-            root.bind("<Configure>", on_resize)
-            root.after(50, fit_bg)
-        except Exception:
+                    bg_state["job"] = root.after(150, fit_bg)
+            root.bind("<Configure>", on_resize, add="+")
+            root.after(300, fit_bg)
+        except Exception as e:
             bg_label = None
-    root.attributes("-topmost", bool(store.settings.get("on_top")))
-    try:
-        root.iconbitmap(os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(__file__)), "icon.ico"))
-    except Exception:
-        pass
+            log(f"background picture failed: {e}")
 
     FILL = "none" if bg_label else "x"     # with a picture, rows only take the space they need so it shows through
 
@@ -161,9 +189,17 @@ def app_mode():
                     log("login window closed without logging in")
                     return
                 with open(out, encoding="utf-8") as f:
-                    cookie = core.unprotect(f.read())
+                    got = json.load(f)
                 os.remove(out)
-                uid, name, display = core.whoami(cookie)
+                cookie = core.unprotect(got["cookie"])
+                page = got.get("user") or {}
+                try:
+                    uid, name, display = core.whoami(cookie)
+                except core.RobloxError as e:
+                    if not page.get("id"):
+                        raise
+                    uid, name, display = str(page["id"]), page.get("name") or str(page["id"]), page.get("display") or ""
+                    log(f"note: roblox's account check said '{e}', used the login page instead")
                 store.add(uid, name, display, cookie)
                 log(f"added {name} ({uid})")
             except Exception as e:
@@ -387,7 +423,11 @@ def app_mode():
     # ---------------- look: colours, background picture, see-through window
     def restart_app():
         if getattr(sys, "frozen", False):
-            subprocess.Popen([sys.executable])
+            # a fully separate copy: without this it reuses (and then loses) this copy's unpacked files
+            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+            for k in [k for k in env if k.startswith("_PYI") or k.startswith("_MEI")]:
+                env.pop(k)
+            subprocess.Popen([sys.executable], env=env, close_fds=True)
         else:
             subprocess.Popen([sys.executable, os.path.abspath(__file__)])
         root.destroy()

@@ -164,6 +164,19 @@ def _request(url, cookie, method="GET", body=None, csrf=None):
     return urllib.request.urlopen(req, timeout=20)
 
 
+def _why(e):
+    """Roblox's own error text from a failed request (never contains the login)"""
+    try:
+        raw = e.read().decode("utf-8", "ignore")
+        d = json.loads(raw)
+        errs = d.get("errors") or []
+        if errs:
+            return "; ".join(str(x.get("message", x)) for x in errs)[:200]
+        return raw[:200]
+    except Exception:
+        return "no details"
+
+
 def _post(url, cookie, body=None):
     """POST with Roblox's CSRF dance: the first try returns 403 + a token to retry with."""
     csrf = None
@@ -176,7 +189,7 @@ def _post(url, cookie, body=None):
                 continue
             if e.code == 401:
                 raise LoginExpired("login expired") from e
-            raise RobloxError(f"Roblox said {e.code} for {url}") from e
+            raise RobloxError(f"Roblox said {e.code} for {url.split('/')[2]}: {_why(e)}") from e
     raise RobloxError("CSRF token was not accepted")
 
 
@@ -187,7 +200,7 @@ def whoami(cookie):
     except urllib.error.HTTPError as e:
         if e.code == 401:
             raise LoginExpired("login expired") from e
-        raise RobloxError(f"Roblox said {e.code}") from e
+        raise RobloxError(f"Roblox said {e.code}: {_why(e)}") from e
     return str(d["id"]), d.get("name", ""), d.get("displayName", "")
 
 
