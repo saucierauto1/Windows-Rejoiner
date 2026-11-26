@@ -24,7 +24,7 @@ import psutil
 BEE_SWARM = "1537690962"
 ERROR_WAIT = 20      # error screen up this long -> restart (NovaHop gets a chance first)
 STALE = 120          # no heartbeat this long -> restart
-BOOT_WAIT = 150      # after a launch, give the window this long to load in
+BOOT_WAIT = 180      # after a launch, give the window this long to load in (slow injectors need time)
 GONE_WAIT = 10       # a tracked window that closed is relaunched after this long
 RETRY = 900          # after 3 restarts that didn't bring it back, only retry this often
 CHECK = 5
@@ -109,7 +109,8 @@ class Store:
                      ("autostart", False), ("on_top", False), ("text_color", "#FFFFFF"),
                      ("wh_status", True), ("status_every", 60), ("shots", True), ("status_msg", ""),
                      ("bg_color", "#000000"), ("btn_color", "#1A1A1A"), ("bg_image", ""), ("alpha", 1.0),
-                     ("show_log", True), ("tray", True), ("update_check", True)):
+                     ("show_log", True), ("tray", True), ("update_check", True), ("launch_min", False),
+                     ("boot_wait", BOOT_WAIT)):
             self.settings.setdefault(k, v)
 
     def save(self):
@@ -449,6 +450,36 @@ def roblox_processes():
     return out
 
 
+def minimize_pid(pid):
+    """minimize a process's windows without focusing them (stops new Roblox windows stealing focus)"""
+    if not IS_WIN:
+        return
+
+    def run():
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        found = []
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def each(hwnd, _):
+            owner = wintypes.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid and u.IsWindowVisible(hwnd):
+                found.append(hwnd)
+            return True
+        cb = proto(each)
+        for _ in range(40):
+            found.clear()
+            u.EnumWindows(cb, 0)
+            if found:
+                for h in found:
+                    u.ShowWindow(h, 7)      # SW_SHOWMINNOACTIVE
+                return
+            time.sleep(0.5)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def kill(pid):
     try:
         psutil.Process(pid).kill()
@@ -537,14 +568,32 @@ class Watcher:
 
     # -------------------------------------------------- one account's window
     def find_pid(self, a, procs):
-        pid = self.pids.get(a["uid"])
+        uid = a["uid"]
+        pid = self.pids.get(uid)
         if pid and any(p[0] == pid for p in procs):
             return pid
         for p in procs:   # launched by us earlier, maybe before the app restarted
             if a["tracker"] in p[1]:
-                self.pids[a["uid"]] = p[0]
+                self.pids[uid] = p[0]
                 return p[0]
+        # Roblox often hands over to a second process while starting, and its anti-cheat can hide the
+        # details above: adopt the first unclaimed Roblox window that started after this account's launch
+        last = self.last.get(uid)
+        if last:
+            claimed = {v for k, v in self.pids.items() if k != uid}
+            cands = sorted((p for p in procs if p[0] not in claimed and last - 5 <= p[2] <= last + 180),
+                           key=lambda p: p[2])
+            if cands:
+                self.pids[uid] = cands[0][0]
+                return cands[0][0]
         return None
+
+    def too_many_windows(self, procs):
+        """never run more Roblox windows than there are enabled accounts"""
+        return len(procs) >= sum(1 for a in self.store.accounts if a.get("enabled", True))
+
+    def boot_wait(self):
+        return max(60, int(self.store.settings.get("boot_wait", BOOT_WAIT)))
 
     def launch(self, a, why):
         uid = a["uid"]
@@ -570,9 +619,16 @@ class Watcher:
         except Exception as e:
             self.status[uid] = "launch failed"
             self.log(f"{a['name']}: couldn't launch ({e})")
-            self.last[uid] = self.now() - BOOT_WAIT + 30   # try again in ~30 s
+            self.last[uid] = self.now() - self.boot_wait() + 30   # try again in ~30 s
             return
-        before = {p[0] for p in self.procs()}
+        before_procs = self.procs()
+        before = {p[0] for p in before_procs}
+        if why in ("Roblox window closed", "not running", "launch all") and self.too_many_windows(before_procs):
+            self.status[uid] = "not opened: already as many roblox windows as accounts"
+            self.log(f"{a['name']}: not opening another Roblox, there are already {len(before_procs)} open "
+                     "(close the extra ones, or use Launch to force it)")
+            self.last[uid] = self.now()
+            return
         self.log(f"Launching {a['name']}: {why}")
         self.open(uri)
         self.last[uid] = self.now()
@@ -594,7 +650,11 @@ class Watcher:
             new = [p[0] for p in procs if p[0] not in before and p[0] not in mine]
             if len(new) == 1:
                 self.pids[a["uid"]] = new[0]
-                return
+                break
+        else:
+            return
+        if self.store.settings.get("launch_min"):
+            minimize_pid(self.pids[a["uid"]])
 
     def notify(self, kind, text):
         s = self.store.settings
@@ -765,14 +825,14 @@ class Watcher:
             hb = beats.get(uid)
             age = now - hb[0] if hb else None
             last = self.last.get(uid)
-            booting = last is not None and now - last < BOOT_WAIT
+            booting = last is not None and now - last < self.boot_wait()
             f = self.fails.get(uid, 0)
 
-            # a fresh heartbeat with no window we ever tracked = running, just not launched by this app
-            fresh = hb is not None and age < 30 and uid not in self.pids
+            # a fresh heartbeat = the account is in the game, even if we lost track of its window
+            fresh = hb is not None and age < 30
             if pid is None and not fresh:
                 # no Roblox window for this account and no recent heartbeat: it isn't running
-                if booting and now - last < 60:
+                if booting and now - last < 90:
                     self.status[uid] = f"starting ({int(now - last)}s)"
                     continue
                 if last is None:

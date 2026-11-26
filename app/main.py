@@ -318,7 +318,7 @@ def app_mode():
             recolor(w, old, new)
 
     def settings_dialog():
-        d = popup("Settings", "500x860")
+        d = popup("Settings", "520x940")
         s = store.settings
 
         def head(t):
@@ -364,6 +364,7 @@ def app_mode():
         checks += [check("start watching when the app opens", "autostart"),
                    check("keep window on top", "on_top"),
                    check("minimize to the tray (next to the clock)", "tray"),
+                   check("open roblox windows minimized (they won't steal focus)", "launch_min"),
                    check("check for updates when the app opens", "update_check")]
         lbl(d, "text colour").pack(anchor="w", padx=10, pady=(4, 0))
         cur = next((k for k, v in COLORS.items() if v.upper() == T["fg"].upper()), "white")
@@ -377,6 +378,7 @@ def app_mode():
         head("-- restart timing (seconds) --")
         ew = entry("restart after an error screen stays up", s.get("error_wait", core.ERROR_WAIT))
         st = entry("restart after no heartbeat for", s.get("stale", core.STALE))
+        bw = entry("loading time after a launch (raise it if your executor injects slowly)", s.get("boot_wait", core.BOOT_WAIT))
 
         def save():
             url = wh.get().strip()
@@ -384,7 +386,7 @@ def app_mode():
                 messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=d)
                 return
             try:
-                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["status_every"] = max(30, int(every.get()))
+                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["boot_wait"] = max(60, int(bw.get())); s["status_every"] = max(30, int(every.get()))
             except ValueError:
                 messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=d)
                 return
