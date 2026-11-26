@@ -1,0 +1,29 @@
+name: Build Windows app
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller==6.11.1
+      - name: Check the code loads
+        run: python -c "import sys; sys.path.insert(0, 'app'); import core, main, customtkinter, webview, psutil; print('ok')"
+      - name: Build NovaHopRejoin.exe
+        run: pyinstaller --noconfirm --onefile --windowed --name NovaHopRejoin --icon app/icon.ico --add-data "app/icon.ico;." --collect-all customtkinter --collect-all webview app/main.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NovaHopRejoin
+          path: dist/NovaHopRejoin.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-v1.0.${{ github.run_number }}
+          name: NovaHop Rejoin for Windows v1.0.${{ github.run_number }}
+          files: dist/NovaHopRejoin.exe
