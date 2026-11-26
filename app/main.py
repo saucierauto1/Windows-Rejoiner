@@ -142,7 +142,12 @@ def app_mode():
                 cv.create_text(x + dx, y + dy, text=s, anchor="nw", font=FNT, fill="#000000", tags=(tag, "txt"))
         cv.create_text(x, y, text=s, anchor="nw", font=FNT, fill=fill, tags=(tag, tag + "_fg", "txt"))
 
+    drawn = {}
+
     def set_text(tag, s, fill=None):
+        if drawn.get(tag) == (s, fill):     # unchanged: don't make windows redraw the picture
+            return
+        drawn[tag] = (s, fill)
         cv.itemconfigure(tag, text=s)
         if fill:
             cv.itemconfigure(tag + "_fg", fill=fill)
@@ -625,6 +630,7 @@ def app_mode():
         """(re)draw everything except the background"""
         cv.delete("txt")
         cv.delete("rowwin")
+        drawn.clear()
         for w in row_widgets:
             w.destroy()
         row_widgets.clear()
@@ -777,7 +783,8 @@ def app_mode():
     root.after(300, fit_bg)
 
     def tick():
-        refresh()
+        if root.state() == "normal":        # minimized / in the tray: nothing to draw
+            refresh()
         root.after(1000, tick)
 
     # ---------------- tray
