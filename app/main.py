@@ -404,6 +404,10 @@ def app_mode():
         fc = entry("fps cap for every roblox window (e.g. 15 or 30)", s.get("fps_cap", 0))
         rt = entry("free up roblox ram every (minutes)", s.get("ram_trim", 0))
         rl = entry("restart an account using more ram than (MB, e.g. 2500)", s.get("ram_limit", 0))
+        cc = entry("cpu limit per roblox window (% of the whole cpu, e.g. 10)", s.get("cpu_cap", 0))
+        low_was = bool(s.get("low_gfx"))
+        checks += [check("lowest graphics: no grass, low textures, gray sky (less ram & gpu)", "low_gfx"),
+                   check("efficiency mode: roblox windows get low priority so your pc stays smooth", "eco")]
 
         def save():
             url = wh.get().strip()
@@ -412,7 +416,7 @@ def app_mode():
                 return
             try:
                 e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["boot_wait"] = max(60, int(bw.get())); s["hop_wait"] = max(10, int(hw.get())); s["status_every"] = max(30, int(every.get()))
-                fps = max(0, int(fc.get())); s["ram_trim"] = max(0, int(rt.get())); s["ram_limit"] = max(0, int(rl.get()))
+                fps = max(0, int(fc.get())); s["ram_trim"] = max(0, int(rt.get())); s["ram_limit"] = max(0, int(rl.get())); s["cpu_cap"] = max(0, min(100, int(cc.get())))
             except ValueError:
                 messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=win)
                 return
@@ -426,6 +430,8 @@ def app_mode():
             s.update(webhook=url, wh_ping=ping.get().strip(), error_wait=e_w, stale=s_t, mouse_key=key)
             for key, v in checks:
                 s[key] = bool(v.get())
+            if bool(s.get("low_gfx")) != low_was:
+                threading.Thread(target=watcher.apply_fps, daemon=True).start()
             new = COLORS[col.get()]
             if new.upper() != T["fg"].upper():
                 old = T["fg"]
@@ -726,7 +732,9 @@ def app_mode():
             elif not on and not t.startswith("login expired"):
                 t = "not watching"
             r = watcher.restarts.get(a["uid"], 0)
-            set_text(tag, f"{t} ({r} restarts)" if r else t, color(t))
+            t2 = f"{t} ({r} restarts)" if r else t
+            mb = watcher.ram.get(a["uid"]) if on else None
+            set_text(tag, f"{t2} | {mb} MB" if mb else t2, color(t))
         with lock:
             new = [t for n, t in lines if n > shown[0]]
             shown[0] = count[0]

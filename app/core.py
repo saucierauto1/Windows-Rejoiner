@@ -114,7 +114,8 @@ class Store:
                      ("bg_color", "#000000"), ("btn_color", "#1A1A1A"), ("bg_image", ""), ("alpha", 1.0),
                      ("show_log", True), ("tray", True), ("update_check", True), ("launch_min", False), ("hop_wait", HOP_WAIT),
                      ("mouse_lock", False), ("mouse_key", "ctrl+alt+l"),
-                     ("boot_wait", BOOT_WAIT), ("fps_cap", 0), ("ram_trim", 0), ("ram_limit", 0), ("ax_dirs", [])):
+                     ("boot_wait", BOOT_WAIT), ("fps_cap", 0), ("ram_trim", 0), ("ram_limit", 0), ("ax_dirs", []),
+                     ("low_gfx", False), ("eco", False), ("cpu_cap", 0)):
             self.settings.setdefault(k, v)
 
     def save(self):
@@ -407,6 +408,12 @@ def install_heartbeat(autoexecs):
 # ------------------------------------------------------------------ fps / ram limiters
 FPS_FILE = "novahop_fps.lua"
 FPS_FLAG = "DFIntTaskSchedulerTargetFps"
+# lowest graphics: only flags Roblox still allows in ClientAppSettings.json (same set RoALT / Bloxstrap use)
+LOW_FLAGS = {"DFIntCSGLevelOfDetailSwitchingDistance": "0", "DFIntCSGLevelOfDetailSwitchingDistanceL12": "0",
+             "DFIntCSGLevelOfDetailSwitchingDistanceL23": "0", "DFIntCSGLevelOfDetailSwitchingDistanceL34": "0",
+             "FIntDebugForceMSAASamples": "1", "DFFlagTextureQualityOverrideEnabled": "True",
+             "DFIntTextureQualityOverride": "0", "FFlagDebugSkyGray": "True", "FIntFRMMinGrassDistance": "0",
+             "FIntFRMMaxGrassDistance": "0", "DFIntDebugFRMQualityLevelOverride": "1"}
 
 
 def _client_settings_dirs():
@@ -426,8 +433,9 @@ def _client_settings_dirs():
     return out
 
 
-def apply_fps(cap, autoexecs):
-    """cap > 0: put an fps cap in every autoexec folder and in Roblox's settings file. 0 removes both."""
+def apply_fps(cap, autoexecs, low=False):
+    """cap > 0: put an fps cap in every autoexec folder and in Roblox's settings file. 0 removes both.
+    low: lowest graphics flags in Roblox's settings file too (removed when off)."""
     n = 0
     for d in autoexecs:
         f = os.path.join(d, FPS_FILE)
@@ -447,11 +455,16 @@ def apply_fps(cap, autoexecs):
             if os.path.exists(f):
                 with open(f, encoding="utf-8") as fh:
                     data = json.load(fh)
+            old = dict(data)
+            want = dict(LOW_FLAGS) if low else {}
             if cap > 0:
-                data[FPS_FLAG] = cap
-            elif FPS_FLAG in data:
-                data.pop(FPS_FLAG)
-            else:
+                want[FPS_FLAG] = str(cap)
+            for k in [FPS_FLAG, *LOW_FLAGS]:
+                if k in want:
+                    data[k] = want[k]
+                else:
+                    data.pop(k, None)
+            if data == old:
                 continue
             os.makedirs(d, exist_ok=True)
             with open(f, "w", encoding="utf-8") as fh:
@@ -459,6 +472,43 @@ def apply_fps(cap, autoexecs):
         except (OSError, ValueError):
             pass
     return n
+
+
+def limit_process(pid, eco, cpu, jobs):
+    """eco: low priority + Windows efficiency mode. cpu: hard cap in % of the whole CPU (0 = none).
+    jobs keeps one job object per window so its cap can be changed later."""
+    if not IS_WIN:
+        return False
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x0200 | 0x0100 | 0x0001 | 0x1000, False, pid)  # SET_INFORMATION|SET_QUOTA|TERMINATE|QUERY_LIMITED
+    if not h:
+        return False
+    try:
+        k.SetPriorityClass(h, 0x4000 if eco else 0x20)                 # BELOW_NORMAL / NORMAL
+
+        class THROTTLE(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+        t = THROTTLE(1, 1, 1 if eco else 0)                              # execution speed throttling = efficiency mode
+        k.SetProcessInformation(h, 4, ctypes.byref(t), ctypes.sizeof(t))
+        mp = wintypes.ULONG(1 if eco else 5)                             # memory priority very low / normal
+        k.SetProcessInformation(h, 0, ctypes.byref(mp), ctypes.sizeof(mp))
+
+        class RATE(ctypes.Structure):
+            _fields_ = [("ControlFlags", wintypes.DWORD), ("CpuRate", wintypes.DWORD)]
+        job = jobs.get(pid)
+        if cpu > 0 or job:
+            if not job:
+                job = k.CreateJobObjectW(None, None)
+                if not job or not k.AssignProcessToJobObject(job, h):
+                    return False
+                jobs[pid] = job
+            r = RATE(0x1 | 0x4, max(1, min(100, cpu)) * 100) if cpu > 0 else RATE(0, 0)   # ENABLE | HARD_CAP
+            k.SetInformationJobObject(job, 15, ctypes.byref(r), ctypes.sizeof(r))
+        return True
+    finally:
+        k.CloseHandle(h)
 
 
 def ram_mb(pid):
@@ -588,6 +638,10 @@ class Watcher:
         self.ticket = auth_ticket
         self.resolve = resolve_share
         self.mem = ram_mb
+        self.limit = limit_process
+        self.limited = {}     # pid -> (eco, cpu) already set on that window
+        self.jobs = {}        # pid -> job object handle (cpu cap)
+        self.ram = {}         # uid -> MB, for the UI
 
     # -------------------------------------------------- control
     def start(self):
@@ -644,7 +698,7 @@ class Watcher:
         cap = int(self.store.settings.get("fps_cap", 0))
         if cap > 0 and not self.store.settings.get("ax_dirs"):
             self.rescan()
-        n = apply_fps(cap, self.store.settings.get("ax_dirs", []))
+        n = apply_fps(cap, self.store.settings.get("ax_dirs", []), bool(self.store.settings.get("low_gfx")))
         if cap > 0:
             self.log(f"fps cap {cap} set ({n} executor autoexec folder(s) + roblox settings), "
                      "windows opened from now on use it")
@@ -915,6 +969,14 @@ class Watcher:
             if uid in [q[0] for q in self.queue]:
                 continue
             pid = self.find_pid(a, procs)
+            if pid:
+                self.ram[uid] = self.mem(pid)
+                want = (bool(self.store.settings.get("eco")), int(self.store.settings.get("cpu_cap", 0)))
+                if self.limited.get(pid) != want and (want != (False, 0) or pid in self.limited):
+                    if self.limit(pid, want[0], want[1], self.jobs):
+                        self.limited[pid] = want
+            else:
+                self.ram.pop(uid, None)
             hb = beats.get(uid)
             age = now - hb[0] if hb else None
             last = self.last.get(uid)
