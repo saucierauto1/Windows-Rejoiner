@@ -340,7 +340,9 @@ def app_mode():
 
         head("-- app --")
         checks += [check("start watching when the app opens", "autostart"),
-                   check("keep window on top", "on_top")]
+                   check("keep window on top", "on_top"),
+                   check("minimize to the tray (next to the clock)", "tray"),
+                   check("check for updates when the app opens", "update_check")]
         lbl(d, "text colour").pack(anchor="w", padx=10, pady=(4, 0))
         cur = next((k for k, v in COLORS.items() if v.upper() == T["fg"].upper()), "white")
         col = tk.StringVar(value=cur)
@@ -479,7 +481,15 @@ def app_mode():
         btn(row, "Reset to default", reset).pack(side="left", padx=4)
 
     # ---------------- accounts
-    lbl(root, "accounts:").pack(anchor="w", padx=10, pady=(10, 0))
+    accbar = tk.Frame(root, bg=BG)
+    accbar.pack(fill=FILL, anchor="w", padx=10, pady=(10, 2))
+    lbl(accbar, "accounts:").pack(side="left")
+
+    def close_all():
+        if messagebox.askyesno("NovaHop Rejoin", "close every roblox window this app launched?"):
+            watcher.close_all()
+    btn(accbar, "Close all", close_all).pack(side="right", padx=(4, 0))
+    btn(accbar, "Launch all", watcher.launch_all).pack(side="right")
     acc_box = tk.Frame(root, bg=BG)
     acc_box.pack(fill=FILL, anchor="w", padx=10)
     rows = {}
@@ -497,6 +507,35 @@ def app_mode():
             a["nick"] = n.strip()
             store.save()
             rows_key[0] = None
+
+    def server_dialog(a):
+        d = popup(f"Server for {a.get('nick') or a['name']}", "460x260")
+        own = tk.IntVar(value=1 if a.get("own_server") else 0)
+        tk.Checkbutton(d, text="use its own game / private server", variable=own, bg=BG, fg=T["fg"],
+                       activebackground=BG, activeforeground=T["fg"], selectcolor=BG, font=FONT).pack(anchor="w", padx=6, pady=(10, 0))
+        lbl(d, "(off = uses the main Game / server setting)", fg=DIM).pack(anchor="w", padx=10)
+
+        def field(text, value):
+            lbl(d, text).pack(anchor="w", padx=10, pady=(8, 0))
+            e = tk.Entry(d, bg="#FFFFFF", fg="#000000", insertbackground="#000000", relief="solid", bd=1, font=FONT)
+            e.pack(fill="x", padx=10)
+            e.insert(0, value)
+            return e
+        place = a.get("place", "")
+        g = field("game link or place id (empty = bee swarm)", "" if place in ("", core.BEE_SWARM) else place)
+        p = field("private server link (empty = public)", a.get("ps_raw", ""))
+
+        def save():
+            pl = core.parse_game(g.get())
+            ps = core.parse_ps(p.get())
+            if pl is None or ps is None:
+                messagebox.showerror("NovaHop Rejoin", "invalid input, nothing changed", parent=d)
+                return
+            a.update(own_server=bool(own.get()), place=pl, ps_raw=p.get().strip())
+            store.save()
+            log(f"{a['name']}: " + (f"own server, place {pl}, private: {'yes' if ps[0] else 'no'}" if own.get() else "uses the main server setting"))
+            d.destroy()
+        btn(d, "Save", save).pack(anchor="w", padx=10, pady=10)
 
     def set_enabled(a, var):
         a["enabled"] = bool(var.get())
@@ -517,10 +556,12 @@ def app_mode():
             name = lbl(r, a.get("nick") or a["name"], width=18)
             name.pack(side="left")
             name.bind("<Double-Button-1>", lambda e, a=a: rename(a))
-            st = lbl(r, "", width=34)
+            st = lbl(r, "", width=30)
             st.pack(side="left")
             btn(r, "x", lambda a=a: remove(a)).pack(side="right")
-            btn(r, "Relaunch", lambda u=a["uid"]: watcher.launch_now(u)).pack(side="right", padx=4)
+            btn(r, "Close", lambda u=a["uid"]: watcher.close(u)).pack(side="right", padx=4)
+            btn(r, "Server", lambda a=a: server_dialog(a)).pack(side="right", padx=(0, 4))
+            btn(r, "Launch", lambda u=a["uid"]: watcher.launch_now(u)).pack(side="right")
             rows[a["uid"]] = st
 
     logbar = tk.Frame(root, bg=BG)
@@ -584,6 +625,78 @@ def app_mode():
     def tick():
         refresh()
         root.after(1000, tick)
+
+    # ---------------- tray
+    tray = {"icon": None}
+    icon_file = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icon.ico")
+
+    def quit_app():
+        if tray["icon"]:
+            try:
+                tray["icon"].stop()
+            except Exception:
+                pass
+        root.destroy()
+        os._exit(0)
+
+    def restore():
+        if tray["icon"]:
+            try:
+                tray["icon"].stop()
+            except Exception:
+                pass
+            tray["icon"] = None
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+
+    def to_tray():
+        try:
+            import pystray
+            from PIL import Image
+        except Exception:
+            return False
+        try:
+            img = Image.open(icon_file)
+        except Exception:
+            img = Image.new("RGB", (64, 64), (0, 0, 0))
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", lambda i, it: root.after(0, restore), default=True),
+            pystray.MenuItem(lambda it: "Stop watching" if watcher.alive else "Start watching",
+                             lambda i, it: root.after(0, toggle)),
+            pystray.MenuItem("Quit", lambda i, it: root.after(0, quit_app)))
+        tray["icon"] = pystray.Icon("NovaHopRejoin", img, "NovaHop Rejoin", menu)
+        tray["icon"].run_detached()
+        root.withdraw()
+        return True
+
+    def on_unmap(e):
+        if e.widget is root and root.state() == "iconic" and store.settings.get("tray", True) and not tray["icon"]:
+            root.after(10, to_tray)
+    root.bind("<Unmap>", on_unmap, add="+")
+
+    # ---------------- update check
+    VERSION_FILE = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "version.txt")
+    try:
+        with open(VERSION_FILE, encoding="utf-8-sig") as f:
+            my_version = int(f.read().strip())
+    except Exception:
+        my_version = None
+    root.title(f"NovaHop Rejoin v1.0.{my_version}" if my_version else "NovaHop Rejoin")
+
+    def check_updates():
+        try:
+            newest = core.latest_version()
+        except Exception:
+            return
+        if my_version and newest and newest > my_version:
+            def ask():
+                log(f"update available: v1.0.{newest} (you have v1.0.{my_version})")
+                if messagebox.askyesno("NovaHop Rejoin", f"a new version is out (v1.0.{newest}).\nopen the download page?"):
+                    __import__("webbrowser").open(f"https://github.com/{core.REPO}/releases/latest")
+            root.after(0, ask)
+    if store.settings.get("update_check", True):
+        threading.Thread(target=check_updates, daemon=True).start()
 
     log("ready. close all roblox windows before pressing start")
     if store.settings.get("autostart") and store.accounts:

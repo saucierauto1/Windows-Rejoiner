@@ -109,7 +109,7 @@ class Store:
                      ("autostart", False), ("on_top", False), ("text_color", "#FFFFFF"),
                      ("wh_status", True), ("status_every", 60), ("shots", True), ("status_msg", ""),
                      ("bg_color", "#000000"), ("btn_color", "#1A1A1A"), ("bg_image", ""), ("alpha", 1.0),
-                     ("show_log", True)):
+                     ("show_log", True), ("tray", True), ("update_check", True)):
             self.settings.setdefault(k, v)
 
     def save(self):
@@ -248,6 +248,31 @@ def launch_uri(ticket, tracker, place, link_code=""):
             + "+placelauncherurl:" + urllib.parse.quote(launcher, safe="")
             + "+browsertrackerid:" + tracker
             + "+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp")
+
+
+def server_for(a, s):
+    """(place, private server link) for an account: its own if set, else the main Game / server setting"""
+    if a.get("own_server"):
+        return a.get("place") or BEE_SWARM, a.get("ps_raw", "")
+    return s["place"], s.get("ps_raw", "")
+
+
+def game_name(place):
+    return "Bee Swarm Simulator" if place == BEE_SWARM else f"Place {place}"
+
+
+# ------------------------------------------------------------------ updates
+REPO = "saucierauto1/Windows-Rejoiner"
+
+
+def latest_version():
+    """newest release number on GitHub (tags look like win-v1.0.12), or None"""
+    req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                 headers={"User-Agent": "NovaHopRejoin", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        tag = json.load(r).get("tag_name", "")
+    m = re.search(r"(\d+)$", tag)
+    return int(m.group(1)) if m else None
 
 
 # ------------------------------------------------------------------ Discord webhook
@@ -513,8 +538,9 @@ class Watcher:
         s = self.store.settings
         try:
             cookie = self.store.cookie(a)
-            place, link = s["place"], ""
-            kind, code = parse_ps(s.get("ps_raw", "")) or ("", "")
+            place, ps_raw = server_for(a, s)
+            link = ""
+            kind, code = parse_ps(ps_raw) or ("", "")
             if kind == "code":
                 link = code
             elif kind == "share":
@@ -592,7 +618,6 @@ class Watcher:
                 time.sleep(0.1)
 
     def status_embed(self):
-        game = "Bee Swarm Simulator" if self.store.settings["place"] == BEE_SWARM else f"Place {self.store.settings['place']}"
         lines, online = [], 0
         for a in self.store.accounts:
             st = self.status.get(a["uid"], "not started") if a.get("enabled", True) else "off"
@@ -612,6 +637,7 @@ class Watcher:
                 except psutil.Error:
                     pass
             name = a.get("nick") or a["name"]
+            game = game_name(server_for(a, self.store.settings)[0])
             lines.append(f"{dot} **{name}** \u2014 {word}\nGame: {game} \u00B7 Rejoins: {self.restarts.get(a['uid'], 0)} \u00B7 RAM: {ram}")
         vm = psutil.virtual_memory()
         cpu = psutil.cpu_percent(interval=1)
@@ -657,11 +683,56 @@ class Watcher:
             self.status[a["uid"]] = "waiting to launch"
 
     def launch_now(self, uid):
-        """the Launch button on one account"""
+        """the Launch button on one account: queued while watching, straight away otherwise"""
         a = self.store.get(uid)
-        if a:
-            pid = self.find_pid(a, self.procs())
+        if not a:
+            return
+        pid = self.find_pid(a, self.procs())
+        if self.alive:
             self.restart(a, pid, "launched by hand")
+            return
+
+        def go():
+            if pid:
+                self.kill(pid)
+                self.pids.pop(uid, None)
+                time.sleep(2)
+            self.launch(a, "launched by hand")
+        threading.Thread(target=go, daemon=True).start()
+
+    def launch_all(self):
+        """open every enabled account that isn't already open, one at a time"""
+        def go():
+            todo = [a for a in self.store.accounts if a.get("enabled", True)]
+            for i, a in enumerate(todo):
+                if self.find_pid(a, self.procs()):
+                    continue
+                if self.alive:
+                    self.want_launch(a, "launch all")
+                    continue
+                self.launch(a, "launch all")
+                if i < len(todo) - 1:
+                    time.sleep(max(5, int(self.store.settings.get("launch_delay", 12))))
+            self.log("launch all: done" if not self.alive else "launch all: queued")
+        threading.Thread(target=go, daemon=True).start()
+
+    def close(self, uid):
+        a = self.store.get(uid)
+        pid = self.find_pid(a, self.procs()) if a else None
+        if pid:
+            self.kill(pid)
+            self.pids.pop(uid, None)
+            self.log(f"closed {a['name']}")
+        elif a:
+            self.log(f"{a['name']} isn't open (or wasn't launched by this app)")
+
+    def close_all(self):
+        for a in self.store.accounts:
+            pid = self.find_pid(a, self.procs())
+            if pid:
+                self.kill(pid)
+                self.pids.pop(a["uid"], None)
+        self.log("closed all accounts launched by this app")
 
     # -------------------------------------------------- one pass over every account
     def tick(self):
