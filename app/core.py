@@ -114,7 +114,7 @@ class Store:
                      ("bg_color", "#000000"), ("btn_color", "#1A1A1A"), ("bg_image", ""), ("alpha", 1.0),
                      ("show_log", True), ("tray", True), ("update_check", True), ("launch_min", False), ("hop_wait", HOP_WAIT),
                      ("mouse_lock", False), ("mouse_key", "ctrl+alt+l"),
-                     ("boot_wait", BOOT_WAIT)):
+                     ("boot_wait", BOOT_WAIT), ("fps_cap", 0), ("ram_trim", 0), ("ram_limit", 0), ("ax_dirs", [])):
             self.settings.setdefault(k, v)
 
     def save(self):
@@ -404,6 +404,86 @@ def install_heartbeat(autoexecs):
     return done
 
 
+# ------------------------------------------------------------------ fps / ram limiters
+FPS_FILE = "novahop_fps.lua"
+FPS_FLAG = "DFIntTaskSchedulerTargetFps"
+
+
+def _client_settings_dirs():
+    """Roblox's ClientSettings folders (every installed version, plus Bloxstrap / Fishstrap)"""
+    out = []
+    la = os.environ.get("LOCALAPPDATA", "")
+    vers = os.path.join(la, "Roblox", "Versions")
+    try:
+        for v in os.listdir(vers):
+            if os.path.isfile(os.path.join(vers, v, "RobloxPlayerBeta.exe")):
+                out.append(os.path.join(vers, v, "ClientSettings"))
+    except OSError:
+        pass
+    for b in ("Bloxstrap", "Fishstrap"):
+        if os.path.isdir(os.path.join(la, b)):
+            out.append(os.path.join(la, b, "Modifications", "ClientSettings"))
+    return out
+
+
+def apply_fps(cap, autoexecs):
+    """cap > 0: put an fps cap in every autoexec folder and in Roblox's settings file. 0 removes both."""
+    n = 0
+    for d in autoexecs:
+        f = os.path.join(d, FPS_FILE)
+        try:
+            if cap > 0:
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write(f"if setfpscap then setfpscap({cap}) end\n")
+                n += 1
+            elif os.path.exists(f):
+                os.remove(f)
+        except OSError:
+            pass
+    for d in _client_settings_dirs():
+        f = os.path.join(d, "ClientAppSettings.json")
+        try:
+            data = {}
+            if os.path.exists(f):
+                with open(f, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            if cap > 0:
+                data[FPS_FLAG] = cap
+            elif FPS_FLAG in data:
+                data.pop(FPS_FLAG)
+            else:
+                continue
+            os.makedirs(d, exist_ok=True)
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except (OSError, ValueError):
+            pass
+    return n
+
+
+def ram_mb(pid):
+    try:
+        mi = psutil.Process(pid).memory_info()
+        return int(getattr(mi, "private", mi.rss) / 1048576)
+    except (psutil.Error, OSError):
+        return 0
+
+
+def trim_ram(pid):
+    """ask Windows to move the window's unused memory out of RAM (what RAM cleaners do)"""
+    if not IS_WIN:
+        return False
+    import ctypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x0100 | 0x0400, False, pid)     # PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION
+    if not h:
+        return False
+    try:
+        return bool(k.K32EmptyWorkingSet(h))
+    finally:
+        k.CloseHandle(h)
+
+
 def read_heartbeats(dirs):
     """newest line per UserId across all folders -> {uid: (ts, state, msg, name)}"""
     best = {}
@@ -507,6 +587,7 @@ class Watcher:
         self.now = time.time
         self.ticket = auth_ticket
         self.resolve = resolve_share
+        self.mem = ram_mb
 
     # -------------------------------------------------- control
     def start(self):
@@ -518,6 +599,7 @@ class Watcher:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         threading.Thread(target=self._report_loop, daemon=True).start()
+        threading.Thread(target=self._ram_loop, daemon=True).start()
 
     def stop(self):
         self.alive = False
@@ -530,6 +612,7 @@ class Watcher:
         self.notify("startstop", f"Watcher started ({len(self.store.accounts)} accounts)")
         if not self.store.settings["hb_dirs"]:
             self.rescan()
+        self.apply_fps()
         while self.alive:
             try:
                 self.tick()
@@ -545,6 +628,7 @@ class Watcher:
         added = install_heartbeat(ax)
         for d in added:
             self.log(f"Heartbeat is in {d}")
+        self.store.settings["ax_dirs"] = list(ax)
         known = self.store.settings["hb_dirs"]
         for d in hb:
             if d not in known:
@@ -555,6 +639,28 @@ class Watcher:
                      "or pick the executor's workspace folder in Folders.")
         self.store.save()
         return hb, ws, ax
+
+    def apply_fps(self):
+        cap = int(self.store.settings.get("fps_cap", 0))
+        if cap > 0 and not self.store.settings.get("ax_dirs"):
+            self.rescan()
+        n = apply_fps(cap, self.store.settings.get("ax_dirs", []))
+        if cap > 0:
+            self.log(f"fps cap {cap} set ({n} executor autoexec folder(s) + roblox settings), "
+                     "windows opened from now on use it")
+
+    def _ram_loop(self):
+        waited = 0
+        while self.alive:
+            time.sleep(1)
+            waited += 1
+            mins = int(self.store.settings.get("ram_trim", 0))
+            if mins <= 0 or waited < mins * 60:
+                continue
+            waited = 0
+            n = sum(1 for pid in set(self.pids.values()) if trim_ram(pid))
+            if n:
+                self.log(f"trimmed ram of {n} roblox window(s)")
 
     # -------------------------------------------------- one account's window
     def find_pid(self, a, procs):
@@ -872,6 +978,11 @@ class Watcher:
             else:
                 self.fails[uid] = 0
                 self.status[uid] = "OK"
+                limit = int(self.store.settings.get("ram_limit", 0))
+                if limit > 0 and pid:
+                    mb = self.mem(pid)
+                    if mb > limit:
+                        self.restart(a, pid, f"using {mb} MB of ram (limit {limit})")
 
         # launch one waiting account per slot, so Roblox isn't flooded
         if self.queue and now >= self.next_launch:

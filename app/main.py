@@ -395,6 +395,11 @@ def app_mode():
         hw = entry("wait for teleport / full server errors (novahop retries these itself)", s.get("hop_wait", core.HOP_WAIT))
         bw = entry("loading time after a launch (raise it if your executor injects slowly)", s.get("boot_wait", core.BOOT_WAIT))
 
+        head("-- performance (0 = off) --")
+        fc = entry("fps cap for every roblox window (e.g. 15 or 30)", s.get("fps_cap", 0))
+        rt = entry("free up roblox ram every (minutes)", s.get("ram_trim", 0))
+        rl = entry("restart an account using more ram than (MB, e.g. 2500)", s.get("ram_limit", 0))
+
         def save():
             url = wh.get().strip()
             if url and not core.is_webhook(url):
@@ -402,9 +407,13 @@ def app_mode():
                 return
             try:
                 e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["boot_wait"] = max(60, int(bw.get())); s["hop_wait"] = max(10, int(hw.get())); s["status_every"] = max(30, int(every.get()))
+                fps = max(0, int(fc.get())); s["ram_trim"] = max(0, int(rt.get())); s["ram_limit"] = max(0, int(rl.get()))
             except ValueError:
                 messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=win)
                 return
+            if fps != int(s.get("fps_cap", 0)):
+                s["fps_cap"] = fps
+                threading.Thread(target=watcher.apply_fps, daemon=True).start()
             key = mk.get().strip().lower()
             if not mouselock.parse_hotkey(key):
                 messagebox.showerror("NovaHop Rejoin", "didn't understand that hotkey. use something like ctrl+alt+l or f8", parent=win)
