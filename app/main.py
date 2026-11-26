@@ -318,7 +318,7 @@ def app_mode():
             recolor(w, old, new)
 
     def settings_dialog():
-        d = popup("Settings", "520x940")
+        d = popup("Settings", "520x1000")
         s = store.settings
 
         def head(t):
@@ -344,8 +344,7 @@ def app_mode():
                   check("message when an account is stuck", "wh_stuck"),
                   check("message when a login expires", "wh_login"),
                   check("message on start / stop", "wh_startstop"),
-                  check("live status message (accounts, ram, cpu)", "wh_status"),
-                  check("add a screenshot to the status", "shots")]
+                  check("live status message (accounts, ram, cpu)", "wh_status")]
         every = entry("update the status every (seconds, min 30)", s.get("status_every", 60))
 
         def test():
@@ -378,6 +377,7 @@ def app_mode():
         head("-- restart timing (seconds) --")
         ew = entry("restart after an error screen stays up", s.get("error_wait", core.ERROR_WAIT))
         st = entry("restart after no heartbeat for", s.get("stale", core.STALE))
+        hw = entry("wait for teleport / full server errors (novahop retries these itself)", s.get("hop_wait", core.HOP_WAIT))
         bw = entry("loading time after a launch (raise it if your executor injects slowly)", s.get("boot_wait", core.BOOT_WAIT))
 
         def save():
@@ -386,7 +386,7 @@ def app_mode():
                 messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=d)
                 return
             try:
-                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["boot_wait"] = max(60, int(bw.get())); s["status_every"] = max(30, int(every.get()))
+                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["boot_wait"] = max(60, int(bw.get())); s["hop_wait"] = max(10, int(hw.get())); s["status_every"] = max(30, int(every.get()))
             except ValueError:
                 messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=d)
                 return

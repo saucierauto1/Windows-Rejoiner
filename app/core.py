@@ -28,6 +28,9 @@ BOOT_WAIT = 180      # after a launch, give the window this long to load in (slo
 GONE_WAIT = 10       # a tracked window that closed is relaunched after this long
 RETRY = 900          # after 3 restarts that didn't bring it back, only retry this often
 CHECK = 5
+HOP_WAIT = 90        # teleport failed / server full: NovaHop retries itself, so wait longer before restarting
+HOPPING = re.compile(r"teleport|experience is full|server is full|game is full|full server|unable to join|"
+                     r"requested experience|joining", re.I)
 ROBLOX_EXE = "robloxplayerbeta.exe"
 HEARTBEAT_LINE = ('loadstring(game:HttpGet("https://gist.githubusercontent.com/saucierauto1/'
                   '4e760d58e39c190bb537f599d9d788a8/raw/NovaHop_Heartbeat.lua"))()')
@@ -109,7 +112,7 @@ class Store:
                      ("autostart", False), ("on_top", False), ("text_color", "#FFFFFF"),
                      ("wh_status", True), ("status_every", 60), ("shots", True), ("status_msg", ""),
                      ("bg_color", "#000000"), ("btn_color", "#1A1A1A"), ("bg_image", ""), ("alpha", 1.0),
-                     ("show_log", True), ("tray", True), ("update_check", True), ("launch_min", False),
+                     ("show_log", True), ("tray", True), ("update_check", True), ("launch_min", False), ("hop_wait", HOP_WAIT),
                      ("boot_wait", BOOT_WAIT)):
             self.settings.setdefault(k, v)
 
@@ -322,20 +325,6 @@ def delete_message(url, mid):
     req = urllib.request.Request(f"{url.strip()}/messages/{mid}", method="DELETE",
                                  headers={"User-Agent": "NovaHopRejoin/1.0"})
     urllib.request.urlopen(req, timeout=15).close()
-
-
-def screenshot_jpg():
-    try:
-        from PIL import ImageGrab
-        import io
-        img = ImageGrab.grab()
-        if img.width > 1280:
-            img = img.resize((1280, img.height * 1280 // img.width))
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=70)
-        return buf.getvalue()
-    except Exception:
-        return None
 
 
 # ------------------------------------------------------------------ several Roblox windows at once
@@ -728,10 +717,7 @@ class Watcher:
         s = self.store.settings
         url = s["webhook"]
         embed = self.status_embed()
-        jpg = screenshot_jpg() if s.get("shots", True) else None
-        if jpg:
-            embed["image"] = {"url": "attachment://screen.jpg"}
-        new = send_status(url, embed, jpg)
+        new = send_status(url, embed)
         old = s.get("status_msg", "")
         if old and old != new:
             try:
@@ -863,7 +849,9 @@ class Watcher:
                 if not self.err_since.get(uid):
                     self.err_since[uid] = now
                     self.log(f"{a['name']}: error on screen: {hb[2]}")
-                if now - self.err_since[uid] >= err_wait:
+                # a teleport / full-server error is NovaHop mid-hop and it retries by itself: give it longer
+                wait = int(self.store.settings.get("hop_wait", HOP_WAIT)) if HOPPING.search(hb[2]) else err_wait
+                if now - self.err_since[uid] >= wait:
                     self.restart(a, pid, f"error screen ({hb[2]})")
                 continue
             if self.err_since.get(uid):
