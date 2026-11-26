@@ -1,0 +1,598 @@
+"""NovaHop Rejoin for Windows: accounts, launching Roblox, and the watcher.
+
+Each account's NovaHop_Heartbeat.lua (in the executor's autoexec) writes
+NovaHop/hb/<UserId>.txt = "time|ok" or "time|error|message|name" every 3 s.
+The watcher reads those files and restarts only that account's Roblox window when
+an error screen stays up, the heartbeat stops, or the window closes.
+"""
+
+import base64
+import json
+import os
+import random
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+import psutil
+
+BEE_SWARM = "1537690962"
+ERROR_WAIT = 20      # error screen up this long -> restart (NovaHop gets a chance first)
+STALE = 120          # no heartbeat this long -> restart
+BOOT_WAIT = 150      # after a launch, give the window this long to load in
+GONE_WAIT = 10       # a tracked window that closed is relaunched after this long
+RETRY = 900          # after 3 restarts that didn't bring it back, only retry this often
+CHECK = 5
+ROBLOX_EXE = "robloxplayerbeta.exe"
+HEARTBEAT_LINE = ('loadstring(game:HttpGet("https://gist.githubusercontent.com/saucierauto1/'
+                  '4e760d58e39c190bb537f599d9d788a8/raw/NovaHop_Heartbeat.lua"))()')
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+IS_WIN = sys.platform == "win32"
+DATA_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "NovaHopRejoin")
+
+
+# ------------------------------------------------------------------ encryption (Windows DPAPI)
+# Sessions are encrypted with the Windows account's own key: only this Windows user on this PC
+# can read them back.
+if IS_WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    class _Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def _dpapi(data: bytes, protect: bool) -> bytes:
+        buf = ctypes.create_string_buffer(data, len(data))
+        src = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        dst = _Blob()
+        fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+        if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(dst)):
+            raise OSError("Windows could not encrypt/decrypt the saved login")
+        try:
+            return ctypes.string_at(dst.pbData, dst.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(dst.pbData)
+else:
+    def _dpapi(data: bytes, protect: bool) -> bytes:   # only for testing off Windows
+        return data
+
+
+def protect(text: str) -> str:
+    return base64.b64encode(_dpapi(text.encode(), True)).decode()
+
+
+def unprotect(blob: str) -> str:
+    return _dpapi(base64.b64decode(blob), False).decode()
+
+
+# ------------------------------------------------------------------ settings and accounts on disk
+def _path(name):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, name)
+
+
+def _load(name, default):
+    try:
+        with open(_path(name), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save(name, data):
+    tmp = _path(name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, _path(name))
+
+
+class Store:
+    """accounts.json: [{uid, name, display, cookie (encrypted), tracker, enabled}]"""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.accounts = _load("accounts.json", [])
+        self.settings = _load("settings.json", {})
+        self.settings.setdefault("place", BEE_SWARM)
+        self.settings.setdefault("ps_raw", "")
+        self.settings.setdefault("launch_delay", 12)
+        self.settings.setdefault("hb_dirs", [])
+
+    def save(self):
+        with self.lock:
+            _save("accounts.json", self.accounts)
+            _save("settings.json", self.settings)
+
+    def get(self, uid):
+        with self.lock:
+            return next((a for a in self.accounts if a["uid"] == uid), None)
+
+    def add(self, uid, name, display, cookie):
+        with self.lock:
+            a = self.get(uid)
+            if a is None:
+                a = {"uid": uid, "tracker": str(random.randint(10**11, 10**12 - 1)), "enabled": True}
+                self.accounts.append(a)
+            a.update(name=name, display=display, cookie=protect(cookie))
+            self.save()
+            return a
+
+    def remove(self, uid):
+        with self.lock:
+            self.accounts = [a for a in self.accounts if a["uid"] != uid]
+            self.save()
+
+    def cookie(self, a):
+        return unprotect(a["cookie"])
+
+
+# ------------------------------------------------------------------ Roblox web calls
+class RobloxError(Exception):
+    pass
+
+
+class LoginExpired(RobloxError):
+    pass
+
+
+def _request(url, cookie, method="GET", body=None, csrf=None):
+    data = json.dumps(body).encode() if body is not None else (b"" if method == "POST" else None)
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Cookie", ".ROBLOSECURITY=" + cookie)
+    req.add_header("User-Agent", UA)
+    req.add_header("Referer", "https://www.roblox.com/")
+    req.add_header("Origin", "https://www.roblox.com")
+    req.add_header("RBXAuthenticationNegotiation", "1")
+    if method == "POST":
+        req.add_header("Content-Type", "application/json")
+    if csrf:
+        req.add_header("X-CSRF-TOKEN", csrf)
+    return urllib.request.urlopen(req, timeout=20)
+
+
+def _post(url, cookie, body=None):
+    """POST with Roblox's CSRF dance: the first try returns 403 + a token to retry with."""
+    csrf = None
+    for _ in range(2):
+        try:
+            return _request(url, cookie, "POST", body, csrf)
+        except urllib.error.HTTPError as e:
+            if e.code == 403 and e.headers.get("x-csrf-token") and not csrf:
+                csrf = e.headers["x-csrf-token"]
+                continue
+            if e.code == 401:
+                raise LoginExpired("login expired") from e
+            raise RobloxError(f"Roblox said {e.code} for {url}") from e
+    raise RobloxError("CSRF token was not accepted")
+
+
+def whoami(cookie):
+    try:
+        with _request("https://users.roblox.com/v1/users/authenticated", cookie) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise LoginExpired("login expired") from e
+        raise RobloxError(f"Roblox said {e.code}") from e
+    return str(d["id"]), d.get("name", ""), d.get("displayName", "")
+
+
+def auth_ticket(cookie):
+    with _post("https://auth.roblox.com/v1/authentication-ticket", cookie) as r:
+        t = r.headers.get("rbx-authentication-ticket")
+    if not t:
+        raise RobloxError("Roblox didn't give a launch ticket")
+    return t
+
+
+def parse_game(text):
+    """Game link or place ID -> place ID ('' = Bee Swarm). None if not understood."""
+    t = (text or "").strip()
+    if not t:
+        return BEE_SWARM
+    m = re.search(r"games/(\d+)", t) or re.search(r"[?&]placeId=(\d+)", t)
+    if m:
+        return m.group(1)
+    return t if t.isdigit() else None
+
+
+def parse_ps(text):
+    """Private server link -> ('code', linkCode) / ('share', code) / ('', ''). None if not understood."""
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+    m = re.search(r"privateServerLinkCode=([A-Za-z0-9_-]+)", t)
+    if m:
+        return "code", m.group(1)
+    m = re.search(r"[?&]code=([A-Za-z0-9_-]+)", t)
+    if m:
+        return "share", m.group(1)
+    return None
+
+
+def resolve_share(cookie, code):
+    """roblox.com/share?code=...&type=Server -> (placeId, linkCode)"""
+    with _post("https://apis.roblox.com/sharelinks/v1/resolve-link", cookie,
+               {"linkId": code, "linkType": "Server"}) as r:
+        d = json.load(r)
+    inv = d.get("privateServerInviteData") or {}
+    if not inv.get("linkCode"):
+        raise RobloxError("That private server link didn't work (expired, or no access)")
+    return str(inv.get("placeId") or ""), inv["linkCode"]
+
+
+def launch_uri(ticket, tracker, place, link_code=""):
+    if link_code:
+        q = (f"request=RequestPrivateGame&placeId={place}&linkCode={link_code}"
+             f"&browserTrackerId={tracker}&joinAttemptId={uuid.uuid4()}&joinAttemptOrigin=PlayButton")
+    else:
+        q = (f"request=RequestGame&browserTrackerId={tracker}&placeId={place}&isPlayTogetherGame=false"
+             f"&joinAttemptId={uuid.uuid4()}&joinAttemptOrigin=PlayButton")
+    launcher = "https://www.roblox.com/Game/PlaceLauncher.ashx?" + q
+    return ("roblox-player:1+launchmode:play+gameinfo:" + ticket
+            + "+launchtime:" + str(int(time.time() * 1000))
+            + "+placelauncherurl:" + urllib.parse.quote(launcher, safe="")
+            + "+browsertrackerid:" + tracker
+            + "+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp")
+
+
+# ------------------------------------------------------------------ several Roblox windows at once
+_mutex = None
+
+
+def allow_multi():
+    """Holding Roblox's single-instance mutex lets several Roblox windows run side by side.
+    Returns False when Roblox was already open (then it only works after closing Roblox)."""
+    global _mutex
+    if not IS_WIN or _mutex:
+        return True
+    import ctypes
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex")
+    return ctypes.windll.kernel32.GetLastError() != 183   # 183 = already existed
+
+
+# ------------------------------------------------------------------ heartbeat folders
+def find_heartbeat_dirs():
+    """Every NovaHop/hb folder an executor workspace has, plus its autoexec folder(s)."""
+    home = os.path.expanduser("~")
+    roots = [(home, 5)]
+    for env in ("LOCALAPPDATA", "APPDATA"):
+        if os.environ.get(env):
+            roots.append((os.environ[env], 3))
+    if IS_WIN:
+        for d in ("C:\\", "D:\\"):
+            if os.path.isdir(d):
+                roots.append((d, 2))
+    skip = {"windows", "program files", "program files (x86)", "programdata", "$recycle.bin", "node_modules",
+            ".git", "packages", "microsoft", "google", "mozilla", "temp", "cache", "steamapps",
+            "system volume information", "appdata"}
+    workspaces, autoexecs = set(), set()
+
+    def walk(path, depth):
+        try:
+            it = list(os.scandir(path))
+        except OSError:
+            return
+        names = {e.name.lower(): e for e in it if e.is_dir(follow_symlinks=False)}
+        for low, e in names.items():
+            if low == "workspace":
+                workspaces.add(e.path)
+            if low.startswith("autoexec") or low in ("auto-exec", "autorun"):
+                autoexecs.add(e.path)
+        if depth <= 0:
+            return
+        for low, e in names.items():
+            if low in skip or low.startswith("."):
+                continue
+            walk(e.path, depth - 1)
+
+    for root, depth in roots:
+        walk(root, depth)
+    hb = []
+    for w in sorted(workspaces):
+        p = os.path.join(w, "NovaHop", "hb")
+        if os.path.isdir(p):
+            hb.append(p)
+    return hb, sorted(workspaces), sorted(autoexecs)
+
+
+def install_heartbeat(autoexecs):
+    done = []
+    for d in autoexecs:
+        try:
+            if any("NovaHop_Heartbeat" in open(os.path.join(d, f), encoding="utf-8", errors="ignore").read()
+                   for f in os.listdir(d) if os.path.isfile(os.path.join(d, f))):
+                done.append(d)
+                continue
+            with open(os.path.join(d, "heartbeat.lua"), "w", encoding="utf-8") as f:
+                f.write(HEARTBEAT_LINE + "\n")
+            done.append(d)
+        except OSError:
+            pass
+    return done
+
+
+def read_heartbeats(dirs):
+    """newest line per UserId across all folders -> {uid: (ts, state, msg, name)}"""
+    best = {}
+    for d in dirs:
+        try:
+            files = os.listdir(d)
+        except OSError:
+            continue
+        for f in files:
+            if not f.endswith(".txt") or not f[:-4].isdigit():
+                continue
+            try:
+                with open(os.path.join(d, f), encoding="utf-8", errors="ignore") as fh:
+                    parts = fh.read().strip().split("|")
+                ts = int(parts[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            uid = f[:-4]
+            if uid not in best or ts > best[uid][0]:
+                best[uid] = (ts, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "",
+                             parts[3] if len(parts) > 3 else "")
+    return best
+
+
+# ------------------------------------------------------------------ Roblox windows (processes)
+def roblox_processes():
+    out = []
+    for p in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+        try:
+            if (p.info["name"] or "").lower() == ROBLOX_EXE:
+                out.append((p.info["pid"], " ".join(p.info["cmdline"] or []), p.info["create_time"] or 0))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return out
+
+
+def kill(pid):
+    try:
+        psutil.Process(pid).kill()
+    except psutil.Error:
+        pass
+
+
+def open_uri(uri):
+    if IS_WIN:
+        os.startfile(uri)
+    else:
+        raise RobloxError("Launching Roblox only works on Windows")
+
+
+# ------------------------------------------------------------------ the watcher
+class Watcher:
+    def __init__(self, store, log):
+        self.store = store
+        self.log = log
+        self.alive = False
+        self.thread = None
+        self.pids = {}        # uid -> pid we launched
+        self.last = {}        # uid -> time of last launch
+        self.err_since = {}
+        self.gone_since = {}
+        self.fails = {}
+        self.restarts = {}
+        self.status = {}      # uid -> text for the UI
+        self.next_launch = 0.0
+        self.queue = []       # uids waiting for their launch slot
+        # hooks (swapped out in tests)
+        self.procs = roblox_processes
+        self.kill = kill
+        self.open = open_uri
+        self.now = time.time
+        self.ticket = auth_ticket
+        self.resolve = resolve_share
+
+    # -------------------------------------------------- control
+    def start(self):
+        if self.alive:
+            return
+        self.alive = True
+        if not allow_multi():
+            self.log("Roblox was already open, so only one window may work. Close all Roblox windows, then Stop and Start.")
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.alive = False
+        self.queue.clear()
+        self.log("Watcher stopped")
+
+    def _run(self):
+        self.log("Watcher started")
+        if not self.store.settings["hb_dirs"]:
+            self.rescan()
+        while self.alive:
+            try:
+                self.tick()
+            except Exception as e:      # never let one bad loop kill the watcher
+                self.log(f"Problem in watcher loop: {e}")
+            for _ in range(CHECK * 10):
+                if not self.alive:
+                    break
+                time.sleep(0.1)
+
+    def rescan(self):
+        hb, ws, ax = find_heartbeat_dirs()
+        added = install_heartbeat(ax)
+        for d in added:
+            self.log(f"Heartbeat is in {d}")
+        known = self.store.settings["hb_dirs"]
+        for d in hb:
+            if d not in known:
+                known.append(d)
+                self.log(f"Watching {d}")
+        if not known:
+            self.log("No NovaHop/hb folder found yet. Join the game once with the executor attached, "
+                     "or pick the executor's workspace folder in Folders.")
+        self.store.save()
+        return hb, ws, ax
+
+    # -------------------------------------------------- one account's window
+    def find_pid(self, a, procs):
+        pid = self.pids.get(a["uid"])
+        if pid and any(p[0] == pid for p in procs):
+            return pid
+        for p in procs:   # launched by us earlier, maybe before the app restarted
+            if a["tracker"] in p[1]:
+                self.pids[a["uid"]] = p[0]
+                return p[0]
+        return None
+
+    def launch(self, a, why):
+        uid = a["uid"]
+        s = self.store.settings
+        try:
+            cookie = self.store.cookie(a)
+            place, link = s["place"], ""
+            kind, code = parse_ps(s.get("ps_raw", "")) or ("", "")
+            if kind == "code":
+                link = code
+            elif kind == "share":
+                p2, link = self.resolve(cookie, code)
+                place = p2 or place
+            uri = launch_uri(self.ticket(cookie), a["tracker"], place, link)
+        except LoginExpired:
+            self.status[uid] = "login expired, log in again"
+            self.log(f"{a['name']}: login expired. Remove the account and add it again.")
+            a["enabled"] = False
+            self.store.save()
+            return
+        except Exception as e:
+            self.status[uid] = "launch failed"
+            self.log(f"{a['name']}: couldn't launch ({e})")
+            self.last[uid] = self.now() - BOOT_WAIT + 30   # try again in ~30 s
+            return
+        before = {p[0] for p in self.procs()}
+        self.log(f"Launching {a['name']}: {why}")
+        self.open(uri)
+        self.last[uid] = self.now()
+        self.err_since[uid] = 0
+        self.gone_since.pop(uid, None)
+        self.status[uid] = "launching"
+        # remember the new window: matched by our tracker id, or the one new window that appeared
+        threading.Thread(target=self._grab_pid, args=(a, before), daemon=True).start()
+
+    def _grab_pid(self, a, before):
+        for _ in range(60):
+            time.sleep(0.5)
+            procs = self.procs()
+            for p in procs:
+                if a["tracker"] in p[1]:
+                    self.pids[a["uid"]] = p[0]
+                    return
+            mine = set(self.pids.values())
+            new = [p[0] for p in procs if p[0] not in before and p[0] not in mine]
+            if len(new) == 1:
+                self.pids[a["uid"]] = new[0]
+                return
+
+    def restart(self, a, pid, why):
+        uid = a["uid"]
+        if pid:
+            self.kill(pid)
+        self.pids.pop(uid, None)
+        self.restarts[uid] = self.restarts.get(uid, 0) + 1
+        self.want_launch(a, why)
+
+    def want_launch(self, a, why):
+        if a["uid"] not in [q[0] for q in self.queue]:
+            self.queue.append((a["uid"], why))
+            self.status[a["uid"]] = "waiting to launch"
+
+    def launch_now(self, uid):
+        """the Launch button on one account"""
+        a = self.store.get(uid)
+        if a:
+            pid = self.find_pid(a, self.procs())
+            self.restart(a, pid, "launched by hand")
+
+    # -------------------------------------------------- one pass over every account
+    def tick(self):
+        now = self.now()
+        procs = self.procs()
+        beats = read_heartbeats(self.store.settings["hb_dirs"])
+        for a in list(self.store.accounts):
+            uid = a["uid"]
+            if not a.get("enabled", True):
+                self.status[uid] = "off"
+                continue
+            if uid in [q[0] for q in self.queue]:
+                continue
+            pid = self.find_pid(a, procs)
+            hb = beats.get(uid)
+            age = now - hb[0] if hb else None
+            last = self.last.get(uid)
+            booting = last is not None and now - last < BOOT_WAIT
+            f = self.fails.get(uid, 0)
+
+            # a fresh heartbeat with no window we ever tracked = running, just not launched by this app
+            fresh = hb is not None and age < 30 and uid not in self.pids
+            if pid is None and not fresh:
+                # no Roblox window for this account and no recent heartbeat: it isn't running
+                if booting and now - last < 60:
+                    self.status[uid] = f"starting ({int(now - last)}s)"
+                    continue
+                if last is None:
+                    self.want_launch(a, "not running")
+                    continue
+                gone = self.gone_since.setdefault(uid, now)
+                if now - gone < GONE_WAIT:
+                    self.status[uid] = "window closed"
+                    continue
+                if f >= 3 and now - last < RETRY:
+                    self.status[uid] = "not coming back, retrying every 15 min"
+                    continue
+                self.fails[uid] = f + 1
+                self.restart(a, None, "Roblox window closed")
+                continue
+            self.gone_since.pop(uid, None)
+
+            if booting:
+                self.status[uid] = f"loading ({int(now - last)}s)"
+                if hb and age < 20 and hb[1] != "error":
+                    self.fails[uid] = 0
+                continue
+
+            if hb and age < STALE and hb[1] == "error":
+                self.status[uid] = "error: " + hb[2]
+                if not self.err_since.get(uid):
+                    self.err_since[uid] = now
+                    self.log(f"{a['name']}: error on screen: {hb[2]}")
+                if now - self.err_since[uid] >= ERROR_WAIT:
+                    self.restart(a, pid, f"error screen ({hb[2]})")
+                continue
+            if self.err_since.get(uid):
+                self.log(f"{a['name']}: error cleared")
+            self.err_since[uid] = 0
+
+            if hb is None or age >= STALE:
+                if f >= 3 and last and now - last < RETRY:
+                    self.status[uid] = "not coming back, retrying every 15 min"
+                    continue
+                if f == 2:
+                    self.log(f"{a['name']} didn't come back after 3 restarts. Is the heartbeat in the executor's "
+                             "autoexec, and is the executor attaching? Retrying every 15 min.")
+                self.fails[uid] = f + 1
+                self.restart(a, pid, "no heartbeat for 2 min" if hb else "no heartbeat yet")
+            else:
+                self.fails[uid] = 0
+                self.status[uid] = "OK"
+
+        # launch one waiting account per slot, so Roblox isn't flooded
+        if self.queue and now >= self.next_launch:
+            uid, why = self.queue.pop(0)
+            a = self.store.get(uid)
+            if a and a.get("enabled", True):
+                self.launch(a, why)
+            self.next_launch = now + max(5, int(self.store.settings.get("launch_delay", 12)))
