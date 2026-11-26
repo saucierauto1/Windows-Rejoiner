@@ -106,7 +106,10 @@ class Store:
         self.settings.setdefault("hb_dirs", [])
         for k, v in (("error_wait", ERROR_WAIT), ("stale", STALE), ("webhook", ""), ("wh_ping", ""),
                      ("wh_restart", True), ("wh_stuck", True), ("wh_login", True), ("wh_startstop", False),
-                     ("autostart", False), ("on_top", False), ("text_color", "#FFFFFF")):
+                     ("autostart", False), ("on_top", False), ("text_color", "#FFFFFF"),
+                     ("wh_status", True), ("status_every", 60), ("shots", True), ("status_msg", ""),
+                     ("bg_color", "#000000"), ("btn_color", "#1A1A1A"), ("bg_image", ""), ("alpha", 1.0),
+                     ("show_log", True)):
             self.settings.setdefault(k, v)
 
     def save(self):
@@ -257,6 +260,43 @@ def send_webhook(url, text):
     req = urllib.request.Request(url.strip(), data=data, method="POST",
                                  headers={"Content-Type": "application/json", "User-Agent": "NovaHopRejoin/1.0"})
     urllib.request.urlopen(req, timeout=10).close()
+
+
+def send_status(url, embed, jpg=None):
+    """Post the status message (optionally with a screenshot). Returns the new message id."""
+    boundary = "----nhr%d" % int(time.time() * 1000)
+    payload = json.dumps({"username": "NovaHop Rejoin", "embeds": [embed]}).encode()
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+            f"Content-Type: application/json\r\n\r\n").encode() + payload + b"\r\n"
+    if jpg:
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"screen.jpg\"\r\n"
+                 f"Content-Type: image/jpeg\r\n\r\n").encode() + jpg + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(url.strip() + "?wait=true", data=body, method="POST",
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
+                                          "User-Agent": "NovaHopRejoin/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return str(json.load(r).get("id", ""))
+
+
+def delete_message(url, mid):
+    req = urllib.request.Request(f"{url.strip()}/messages/{mid}", method="DELETE",
+                                 headers={"User-Agent": "NovaHopRejoin/1.0"})
+    urllib.request.urlopen(req, timeout=15).close()
+
+
+def screenshot_jpg():
+    try:
+        from PIL import ImageGrab
+        import io
+        img = ImageGrab.grab()
+        if img.width > 1280:
+            img = img.resize((1280, img.height * 1280 // img.width))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=70)
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------ several Roblox windows at once
@@ -418,6 +458,7 @@ class Watcher:
             self.log("Roblox was already open, so only one window may work. Close all Roblox windows, then Stop and Start.")
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+        threading.Thread(target=self._report_loop, daemon=True).start()
 
     def stop(self):
         self.alive = False
@@ -531,6 +572,75 @@ class Watcher:
             except Exception as e:
                 self.log(f"Discord webhook failed: {e}")
         threading.Thread(target=go, daemon=True).start()
+
+    # -------------------------------------------------- live Discord status message
+    def _report_loop(self):
+        for _ in range(200):          # first update ~20 s after start
+            if not self.alive:
+                return
+            time.sleep(0.1)
+        while self.alive:
+            s = self.store.settings
+            if is_webhook(s.get("webhook", "")) and s.get("wh_status", True):
+                try:
+                    self.post_status()
+                except Exception as e:
+                    self.log(f"Discord status failed: {e}")
+            for _ in range(max(30, int(s.get("status_every", 60))) * 10):
+                if not self.alive:
+                    return
+                time.sleep(0.1)
+
+    def status_embed(self):
+        game = "Bee Swarm Simulator" if self.store.settings["place"] == BEE_SWARM else f"Place {self.store.settings['place']}"
+        lines, online = [], 0
+        for a in self.store.accounts:
+            st = self.status.get(a["uid"], "not started") if a.get("enabled", True) else "off"
+            if st == "OK":
+                dot, word = "\U0001F7E2", "Online"; online += 1
+            elif st.startswith(("loading", "starting", "launching", "waiting", "window closed")):
+                dot, word = "\U0001F7E1", st[:1].upper() + st[1:]
+            elif st in ("off", "not started"):
+                dot, word = "\u26AB", st[:1].upper() + st[1:]
+            else:
+                dot, word = "\U0001F534", st[:1].upper() + st[1:]
+            ram = "\u2013"
+            pid = self.pids.get(a["uid"])
+            if pid:
+                try:
+                    ram = f"{psutil.Process(pid).memory_info().rss // (1024 * 1024)} MB"
+                except psutil.Error:
+                    pass
+            name = a.get("nick") or a["name"]
+            lines.append(f"{dot} **{name}** \u2014 {word}\nGame: {game} \u00B7 Rejoins: {self.restarts.get(a['uid'], 0)} \u00B7 RAM: {ram}")
+        vm = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=1)
+        return {
+            "title": f"NovaHop Rejoin \u00B7 {online}/{len(self.store.accounts)} online",
+            "description": ("\n\n".join(lines) or "No accounts yet.")[:3900],
+            "color": 0x7C3AED,
+            "fields": [{"name": "PC", "value": f"CPU {cpu:.0f}% \u00B7 RAM {vm.used / 1024**3:.1f} / {vm.total / 1024**3:.1f} GB",
+                        "inline": False}],
+            "footer": {"text": f"Updates every {max(30, int(self.store.settings.get('status_every', 60)))}s"},
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+    def post_status(self):
+        s = self.store.settings
+        url = s["webhook"]
+        embed = self.status_embed()
+        jpg = screenshot_jpg() if s.get("shots", True) else None
+        if jpg:
+            embed["image"] = {"url": "attachment://screen.jpg"}
+        new = send_status(url, embed, jpg)
+        old = s.get("status_msg", "")
+        if old and old != new:
+            try:
+                delete_message(url, old)
+            except Exception:
+                pass
+        s["status_msg"] = new
+        self.store.save()
 
     def restart(self, a, pid, why):
         uid = a["uid"]

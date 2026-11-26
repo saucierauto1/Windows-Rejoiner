@@ -45,11 +45,13 @@ def app_mode():
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
-    BG = "#000000"; FG = "#FFFFFF"; DIM = "#888888"; BTN = "#1A1A1A"
     FONT = ("Consolas", 10)
     DISCORD = "https://discord.gg/brfJ2ZtegE"
 
     store = core.Store()
+    BG = store.settings.get("bg_color", "#000000")
+    BTN = store.settings.get("btn_color", "#1A1A1A")
+    DIM = "#888888"
     T = {"fg": store.settings.get("text_color", "#FFFFFF")}
     lines = []
     lock = threading.Lock()
@@ -65,16 +67,54 @@ def app_mode():
 
     root = tk.Tk()
     root.title("NovaHop Rejoin")
-    root.geometry("640x620")
+    root.geometry("760x640")
     root.configure(bg=BG)
+    try:
+        root.attributes("-alpha", max(0.4, min(1.0, float(store.settings.get("alpha", 1.0)))))
+    except Exception:
+        pass
+
+    # background picture, stretched to fill the window behind everything
+    bg_label = None
+    bg_path = store.settings.get("bg_image", "")
+    if bg_path and os.path.exists(bg_path):
+        try:
+            from PIL import Image, ImageTk
+            bg_src = Image.open(bg_path).convert("RGB")
+            bg_label = tk.Label(root, bd=0, bg=BG)
+            bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+            bg_state = {"size": None, "job": None}
+
+            def fit_bg(_=None):
+                w, h = max(root.winfo_width(), 50), max(root.winfo_height(), 50)
+                if bg_state["size"] == (w, h):
+                    return
+                bg_state["size"] = (w, h)
+                r = max(w / bg_src.width, h / bg_src.height)          # cover the window, crop the rest
+                im = bg_src.resize((int(bg_src.width * r) + 1, int(bg_src.height * r) + 1))
+                l, t = (im.width - w) // 2, (im.height - h) // 2
+                bg_label.img = ImageTk.PhotoImage(im.crop((l, t, l + w, t + h)))
+                bg_label.configure(image=bg_label.img)
+
+            def on_resize(e):
+                if e.widget is root:
+                    if bg_state["job"]:
+                        root.after_cancel(bg_state["job"])
+                    bg_state["job"] = root.after(120, fit_bg)
+            root.bind("<Configure>", on_resize)
+            root.after(50, fit_bg)
+        except Exception:
+            bg_label = None
     root.attributes("-topmost", bool(store.settings.get("on_top")))
     try:
         root.iconbitmap(os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(__file__)), "icon.ico"))
     except Exception:
         pass
 
+    FILL = "none" if bg_label else "x"     # with a picture, rows only take the space they need so it shows through
+
     def btn(parent, text, cmd, width=None):
-        b = tk.Button(parent, text=text, command=cmd, bg=BTN, fg=T["fg"], activebackground="#333333",
+        b = tk.Button(parent, text=text, command=cmd, bg=BTN, fg=T["fg"], activebackground=DIM,
                       activeforeground=T["fg"], relief="solid", bd=1, font=FONT, padx=8, pady=3)
         if width:
             b.configure(width=width)
@@ -84,7 +124,7 @@ def app_mode():
         return tk.Label(parent, text=text, bg=BG, fg=fg or T["fg"], font=FONT, anchor="w", justify="left", **kw)
 
     top = tk.Frame(root, bg=BG)
-    top.pack(fill="x", padx=10, pady=(10, 4))
+    top.pack(fill=FILL, anchor="w", padx=10, pady=(10, 4))
     status_lbl = lbl(top, "status: stopped")
     status_lbl.pack(anchor="w")
     info_lbl = lbl(top, fg=DIM)
@@ -101,7 +141,7 @@ def app_mode():
         refresh()
 
     bar = tk.Frame(root, bg=BG)
-    bar.pack(fill="x", padx=10, pady=4)
+    bar.pack(fill=FILL, anchor="w", padx=10, pady=4)
     start_btn = btn(bar, "Start", toggle, 8)
     start_btn.pack(side="left")
 
@@ -236,6 +276,7 @@ def app_mode():
 
     btn(bar, "Folders", folders_dialog).pack(side="left", padx=4)
     btn(bar, "Settings", lambda: settings_dialog()).pack(side="left", padx=4)
+    btn(bar, "Look", lambda: look_dialog()).pack(side="left", padx=4)
     btn(bar, "Discord", lambda: __import__("webbrowser").open(DISCORD)).pack(side="left", padx=4)
 
 
@@ -255,7 +296,7 @@ def app_mode():
             recolor(w, old, new)
 
     def settings_dialog():
-        d = popup("Settings", "500x720")
+        d = popup("Settings", "500x860")
         s = store.settings
 
         def head(t):
@@ -280,7 +321,10 @@ def app_mode():
         checks = [check("message on every restart", "wh_restart"),
                   check("message when an account is stuck", "wh_stuck"),
                   check("message when a login expires", "wh_login"),
-                  check("message on start / stop", "wh_startstop")]
+                  check("message on start / stop", "wh_startstop"),
+                  check("live status message (accounts, ram, cpu)", "wh_status"),
+                  check("add a screenshot to the status", "shots")]
+        every = entry("update the status every (seconds, min 30)", s.get("status_every", 60))
 
         def test():
             url = wh.get().strip()
@@ -316,7 +360,7 @@ def app_mode():
                 messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=d)
                 return
             try:
-                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get()))
+                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["status_every"] = max(30, int(every.get()))
             except ValueError:
                 messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=d)
                 return
@@ -337,10 +381,107 @@ def app_mode():
 
         btn(d, "Save", save).pack(anchor="w", padx=10, pady=12)
 
+
+    # ---------------- look: colours, background picture, see-through window
+    def restart_app():
+        if getattr(sys, "frozen", False):
+            subprocess.Popen([sys.executable])
+        else:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+        root.destroy()
+        os._exit(0)
+
+    def look_dialog():
+        from tkinter import colorchooser
+        d = popup("Look", "460x470")
+        s = store.settings
+        new = {k: s.get(k) for k in ("bg_color", "btn_color", "bg_image", "alpha", "show_log")}
+
+        def color_row(text, key):
+            row = tk.Frame(d, bg=BG)
+            row.pack(fill="x", padx=10, pady=4)
+            sw = tk.Label(row, width=4, bg=new[key], relief="solid", bd=1)
+            sw.pack(side="left")
+            lbl(row, " " + text).pack(side="left")
+
+            def pick():
+                c = colorchooser.askcolor(color=new[key], parent=d, title=text)[1]
+                if c:
+                    new[key] = c
+                    sw.configure(bg=c)
+            btn(row, "pick", pick).pack(side="right")
+
+        lbl(d, "-- colours --", fg=DIM).pack(anchor="w", padx=10, pady=(10, 0))
+        color_row("background colour", "bg_color")
+        color_row("button colour", "btn_color")
+        lbl(d, "(text colour is in Settings)", fg=DIM).pack(anchor="w", padx=10)
+
+        lbl(d, "-- background picture --", fg=DIM).pack(anchor="w", padx=10, pady=(12, 0))
+        pic = lbl(d, os.path.basename(new["bg_image"]) if new["bg_image"] else "none")
+        pic.pack(anchor="w", padx=10)
+        prow = tk.Frame(d, bg=BG)
+        prow.pack(anchor="w", padx=10, pady=4)
+
+        def choose():
+            f = filedialog.askopenfilename(parent=d, title="pick a background picture",
+                                           filetypes=[("pictures", "*.png *.jpg *.jpeg *.gif *.bmp *.webp")])
+            if not f:
+                return
+            try:
+                from PIL import Image
+                im = Image.open(f).convert("RGB")
+                im.thumbnail((2560, 1440))
+                dest = os.path.join(core.DATA_DIR, "background.png")
+                os.makedirs(core.DATA_DIR, exist_ok=True)
+                im.save(dest)                 # keep our own copy, so moving the original doesn't break it
+                new["bg_image"] = dest
+                pic.configure(text=os.path.basename(f))
+            except Exception as e:
+                messagebox.showerror("NovaHop Rejoin", f"couldn't open that picture: {e}", parent=d)
+
+        def clear():
+            new["bg_image"] = ""
+            pic.configure(text="none")
+        btn(prow, "Choose picture", choose).pack(side="left")
+        btn(prow, "Remove", clear).pack(side="left", padx=4)
+
+        lbl(d, "-- window --", fg=DIM).pack(anchor="w", padx=10, pady=(12, 0))
+        lbl(d, "see-through (100 = solid)").pack(anchor="w", padx=10)
+        op = tk.Scale(d, from_=40, to=100, orient="horizontal", bg=BG, fg=T["fg"], troughcolor=BTN,
+                      highlightthickness=0, font=FONT, length=260)
+        op.set(int(float(new["alpha"] or 1.0) * 100))
+        op.configure(command=lambda v: root.attributes("-alpha", int(v) / 100))
+        op.pack(anchor="w", padx=10)
+        sl = tk.IntVar(value=1 if new["show_log"] else 0)
+        tk.Checkbutton(d, text="show the log", variable=sl, bg=BG, fg=T["fg"], activebackground=BG,
+                       activeforeground=T["fg"], selectcolor=BG, font=FONT).pack(anchor="w", padx=6)
+
+        def save():
+            new["alpha"] = int(op.get()) / 100
+            new["show_log"] = bool(sl.get())
+            changed = any(new[k] != s.get(k) for k in ("bg_color", "btn_color", "bg_image", "show_log"))
+            s.update(new)
+            store.save()
+            d.destroy()
+            if changed and messagebox.askyesno("NovaHop Rejoin", "restart the app now to apply the new look?\n"
+                                                                 "(your roblox windows keep running)"):
+                restart_app()
+
+        def reset():
+            new.update(bg_color="#000000", btn_color="#1A1A1A", bg_image="", alpha=1.0, show_log=True)
+            op.set(100)
+            sl.set(1)
+            save()
+
+        row = tk.Frame(d, bg=BG)
+        row.pack(anchor="w", padx=10, pady=12)
+        btn(row, "Save", save).pack(side="left")
+        btn(row, "Reset to default", reset).pack(side="left", padx=4)
+
     # ---------------- accounts
     lbl(root, "accounts:").pack(anchor="w", padx=10, pady=(10, 0))
     acc_box = tk.Frame(root, bg=BG)
-    acc_box.pack(fill="x", padx=10)
+    acc_box.pack(fill=FILL, anchor="w", padx=10)
     rows = {}
     rows_key = [None]
 
@@ -369,7 +510,7 @@ def app_mode():
             lbl(acc_box, "no accounts", fg=DIM).pack(anchor="w")
         for a in store.accounts:
             r = tk.Frame(acc_box, bg=BG)
-            r.pack(fill="x", pady=1)
+            r.pack(fill=FILL, anchor="w", pady=1)
             var = tk.IntVar(value=1 if a.get("enabled", True) else 0)
             tk.Checkbutton(r, variable=var, bg=BG, activebackground=BG, selectcolor=BG, fg=T["fg"],
                            command=lambda a=a, v=var: set_enabled(a, v)).pack(side="left")
@@ -383,7 +524,7 @@ def app_mode():
             rows[a["uid"]] = st
 
     logbar = tk.Frame(root, bg=BG)
-    logbar.pack(fill="x", padx=10, pady=(10, 0))
+    logbar.pack(fill=FILL, anchor="w", padx=10, pady=(10, 0))
     lbl(logbar, "log:").pack(side="left")
 
     def clear_log():
@@ -394,6 +535,9 @@ def app_mode():
     log_box = tk.Text(root, bg=BG, fg=DIM, font=FONT, relief="solid", bd=1, height=12,
                       highlightthickness=0, state="disabled")
     log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    if not store.settings.get("show_log", True):
+        logbar.pack_forget()
+        log_box.pack_forget()
     shown = [0]
 
     def color(s):
