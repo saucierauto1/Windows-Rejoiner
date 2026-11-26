@@ -95,8 +95,8 @@ def app_mode():
     except Exception:
         pass
 
-    # background picture, stretched to fill the window behind everything
-    bg_label = None
+    # background picture (drawn on the main canvas below)
+    bg_src = None
     bg_path = store.settings.get("bg_image", "")
     if bg_path and not os.path.exists(bg_path):
         log(f"background picture is missing ({bg_path}), pick it again in Look")
@@ -104,63 +104,15 @@ def app_mode():
         try:
             from PIL import Image
             bg_src = Image.open(bg_path).convert("RGB")
-            bg_cache = os.path.join(core.DATA_DIR, "background_fit.png")
-            bg_label = tk.Label(root, bd=0, bg=BG)
-            bg_label.place(x=0, y=0, relwidth=1, relheight=1)
-            bg_state = {"size": None, "job": None}
-
-            def fit_bg():
-                try:
-                    w, h = root.winfo_width(), root.winfo_height()
-                    if w < 50 or h < 50:
-                        root.after(200, fit_bg)
-                        return
-                    if bg_state["size"] == (w, h):
-                        return
-                    bg_state["size"] = (w, h)
-                    mode = store.settings.get("bg_mode", "fill")
-                    if mode == "stretch":
-                        out = bg_src.resize((w, h))
-                    elif mode in ("fit", "center"):
-                        out = Image.new("RGB", (w, h), BG)
-                        r = min(w / bg_src.width, h / bg_src.height) if mode == "fit" else min(1.0, w / bg_src.width, h / bg_src.height)
-                        im = bg_src.resize((max(1, int(bg_src.width * r)), max(1, int(bg_src.height * r))))
-                        out.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
-                    elif mode == "tile":
-                        out = Image.new("RGB", (w, h), BG)
-                        for y in range(0, h, bg_src.height):
-                            for x in range(0, w, bg_src.width):
-                                out.paste(bg_src, (x, y))
-                    else:                                                     # fill: cover the window, crop the rest
-                        r = max(w / bg_src.width, h / bg_src.height)
-                        im = bg_src.resize((int(bg_src.width * r) + 1, int(bg_src.height * r) + 1))
-                        l, t = (im.width - w) // 2, (im.height - h) // 2
-                        out = im.crop((l, t, l + w, t + h))
-                    out.save(bg_cache)
-                    bg_label.img = tk.PhotoImage(file=bg_cache)            # Tk reads PNG itself
-                    bg_label.configure(image=bg_label.img)
-                    bg_label.lower()
-                except Exception as e:
-                    log(f"background picture failed: {e}")
-
-            def on_resize(e):
-                if e.widget is root:
-                    if bg_state["job"]:
-                        root.after_cancel(bg_state["job"])
-                    bg_state["job"] = root.after(150, fit_bg)
-            root.bind("<Configure>", on_resize, add="+")
-            root.after(300, fit_bg)
         except Exception as e:
-            bg_label = None
             log(f"background picture failed: {e}")
+    PIC = bg_src is not None
 
     root.attributes("-topmost", bool(store.settings.get("on_top")))
     try:
         root.iconbitmap(default=os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icon.ico"))
     except Exception:
         pass
-
-    FILL = "none" if bg_label else "x"     # with a picture, rows only take the space they need so it shows through
 
     def btn(parent, text, cmd, width=None):
         b = tk.Button(parent, text=text, command=cmd, bg=BTN, fg=T["fg"], activebackground=DIM,
@@ -172,12 +124,26 @@ def app_mode():
     def lbl(parent, text="", fg=None, **kw):
         return tk.Label(parent, text=text, bg=BG, fg=fg or T["fg"], font=FONT, anchor="w", justify="left", **kw)
 
-    top = tk.Frame(root, bg=BG)
-    top.pack(fill=FILL, anchor="w", padx=10, pady=(10, 4))
-    status_lbl = lbl(top, "status: stopped")
-    status_lbl.pack(anchor="w")
-    info_lbl = lbl(top, fg=DIM)
-    info_lbl.pack(anchor="w")
+    # ---------------- the main screen is one canvas: text is written straight onto the background
+    import tkinter.font as tkfont
+    cv = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
+    cv.place(x=0, y=0, relwidth=1, relheight=1)
+    FNT = tkfont.Font(family="Consolas", size=10)
+    LH = FNT.metrics("linespace") + 2
+    CW = FNT.measure("0")
+    bg_item = cv.create_image(0, 0, anchor="nw")
+    bar_btns = []
+
+    def text(x, y, s, fill, tag):
+        if PIC:   # dark outline so text stays readable on any picture
+            for dx, dy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+                cv.create_text(x + dx, y + dy, text=s, anchor="nw", font=FNT, fill="#000000", tags=(tag, "txt"))
+        cv.create_text(x, y, text=s, anchor="nw", font=FNT, fill=fill, tags=(tag, tag + "_fg", "txt"))
+
+    def set_text(tag, s, fill=None):
+        cv.itemconfigure(tag, text=s)
+        if fill:
+            cv.itemconfigure(tag + "_fg", fill=fill)
 
     def toggle():
         if watcher.alive:
@@ -189,14 +155,13 @@ def app_mode():
             watcher.start()
         refresh()
 
-    bar = tk.Frame(root, bg=BG)
-    bar.pack(fill=FILL, anchor="w", padx=10, pady=4)
-    start_btn = btn(bar, "Start", toggle, 8)
-    start_btn.pack(side="left")
+    start_btn = btn(cv, "Start", toggle, 8)
+    bar_btns.append(start_btn)
 
     # ---------------- add account
     def add_account():
         add_btn.configure(state="disabled", text="log in in the new window...")
+        place_bar()
         out = os.path.join(tempfile.gettempdir(), f"nhr_login_{os.getpid()}_{int(time.time())}.tmp")
         if getattr(sys, "frozen", False):
             cmd = [sys.executable, "--login", out]
@@ -230,12 +195,12 @@ def app_mode():
                     os.remove(out)
                 except OSError:
                     pass
-                root.after(0, lambda: add_btn.configure(state="normal", text="Add account"))
+                root.after(0, lambda: (add_btn.configure(state="normal", text="Add account"), place_bar()))
 
         threading.Thread(target=run, daemon=True).start()
 
-    add_btn = btn(bar, "Add account", add_account)
-    add_btn.pack(side="left", padx=4)
+    add_btn = btn(cv, "Add account", add_account)
+    bar_btns.append(add_btn)
 
     def popup(title, size):
         d = tk.Toplevel(root, bg=BG)
@@ -278,7 +243,7 @@ def app_mode():
 
         btn(d, "Save", save).pack(anchor="w", padx=10, pady=10)
 
-    btn(bar, "Game / server", game_dialog).pack(side="left", padx=4)
+    bar_btns.append(btn(cv, "Game / server", game_dialog))
 
     # ---------------- heartbeat folders
     def folders_dialog():
@@ -331,10 +296,10 @@ def app_mode():
         btn(row, "Pick folder", pick).pack(side="left", padx=4)
         draw()
 
-    btn(bar, "Folders", folders_dialog).pack(side="left", padx=4)
-    btn(bar, "Settings", lambda: settings_dialog()).pack(side="left", padx=4)
-    btn(bar, "Look", lambda: look_dialog()).pack(side="left", padx=4)
-    btn(bar, "Discord", lambda: __import__("webbrowser").open(DISCORD)).pack(side="left", padx=4)
+    bar_btns.append(btn(cv, "Folders", folders_dialog))
+    bar_btns.append(btn(cv, "Settings", lambda: settings_dialog()))
+    bar_btns.append(btn(cv, "Look", lambda: look_dialog()))
+    bar_btns.append(btn(cv, "Discord", lambda: __import__("webbrowser").open(DISCORD)))
 
 
     # ---------------- settings
@@ -556,19 +521,14 @@ def app_mode():
         btn(row, "Reset to default", reset).pack(side="left", padx=4)
 
     # ---------------- accounts
-    accbar = tk.Frame(root, bg=BG)
-    accbar.pack(fill=FILL, anchor="w", padx=10, pady=(10, 2))
-    lbl(accbar, "accounts:").pack(side="left")
-
     def close_all():
         if messagebox.askyesno("NovaHop Rejoin", "close every roblox window this app launched?"):
             watcher.close_all()
-    btn(accbar, "Close all", close_all).pack(side="right", padx=(4, 0))
-    btn(accbar, "Launch all", watcher.launch_all).pack(side="right")
-    acc_box = tk.Frame(root, bg=BG)
-    acc_box.pack(fill=FILL, anchor="w", padx=10)
     rows = {}
     rows_key = [None]
+    row_widgets = []
+    log_view = {"y": 0, "lines": []}
+    shown = [0]
 
     def remove(a):
         if messagebox.askyesno("NovaHop Rejoin", f"remove {a['name']}? its saved login gets deleted"):
@@ -616,49 +576,82 @@ def app_mode():
         a["enabled"] = bool(var.get())
         store.save()
 
-    def build_rows():
-        for w in acc_box.winfo_children():
-            w.destroy()
-        rows.clear()
-        if not store.accounts:
-            lbl(acc_box, "no accounts", fg=DIM).pack(anchor="w")
-        for a in store.accounts:
-            r = tk.Frame(acc_box, bg=BG)
-            r.pack(fill=FILL, anchor="w", pady=1)
-            var = tk.IntVar(value=1 if a.get("enabled", True) else 0)
-            tk.Checkbutton(r, variable=var, bg=BG, activebackground=BG, selectcolor=BG, fg=T["fg"],
-                           command=lambda a=a, v=var: set_enabled(a, v)).pack(side="left")
-            name = lbl(r, a.get("nick") or a["name"], width=18)
-            name.pack(side="left")
-            name.bind("<Double-Button-1>", lambda e, a=a: rename(a))
-            st = lbl(r, "", width=30)
-            st.pack(side="left")
-            btn(r, "x", lambda a=a: remove(a)).pack(side="right")
-            btn(r, "Close", lambda u=a["uid"]: watcher.close(u)).pack(side="right", padx=4)
-            btn(r, "Server", lambda a=a: server_dialog(a)).pack(side="right", padx=(0, 4))
-            btn(r, "Launch", lambda u=a["uid"]: watcher.launch_now(u)).pack(side="right")
-            rows[a["uid"]] = st
+    def place_bar():
+        cv.delete("barwin")
+        cv.update_idletasks()
+        x = 12
+        for b in bar_btns:
+            cv.create_window(x, layout_y["bar"], window=b, anchor="nw", tags="barwin")
+            x += b.winfo_reqwidth() + 6
 
-    logbar = tk.Frame(root, bg=BG)
-    logbar.pack(fill=FILL, anchor="w", padx=10, pady=(10, 0))
-    lbl(logbar, "log:").pack(side="left")
+    layout_y = {"bar": 12 + LH * 2 + 6}
+
+    def layout():
+        """(re)draw everything except the background"""
+        cv.delete("txt")
+        cv.delete("rowwin")
+        for w in row_widgets:
+            w.destroy()
+        row_widgets.clear()
+        rows.clear()
+        x0 = 12
+        text(x0, 10, "status: stopped", T["fg"], "status")
+        text(x0, 10 + LH, "", DIM, "info")
+        place_bar()
+        bh = start_btn.winfo_reqheight()
+        y = layout_y["bar"] + bh + 14
+
+        def rbtn(t, cmd, x, yy):
+            b = btn(cv, t, cmd)
+            row_widgets.append(b)
+            cv.create_window(x, yy, window=b, anchor="nw", tags="rowwin")
+            return x + b.winfo_reqwidth() + 4
+
+        text(x0, y + 4, "accounts:", T["fg"], "acc_h")
+        x = x0 + FNT.measure("accounts: ") + 6
+        x = rbtn("Launch all", watcher.launch_all, x, y)
+        rbtn("Close all", close_all, x, y)
+        y += bh + 8
+        if not store.accounts:
+            text(x0, y, "no accounts", DIM, "noacc")
+            y += LH + 6
+        for a in store.accounts:
+            var = tk.IntVar(value=1 if a.get("enabled", True) else 0)
+            cb = tk.Checkbutton(cv, variable=var, bg=BTN, activebackground=BTN, selectcolor=BG, fg=T["fg"],
+                                bd=0, highlightthickness=0, command=lambda a=a, v=var: set_enabled(a, v))
+            cb.var = var
+            row_widgets.append(cb)
+            cv.create_window(x0, y + 2, window=cb, anchor="nw", tags="rowwin")
+            tag = "nm_" + a["uid"]
+            text(x0 + 28, y + 4, a.get("nick") or a["name"], T["fg"], tag)
+            cv.tag_bind(tag, "<Double-Button-1>", lambda e, a=a: rename(a))
+            text(x0 + 28 + CW * 18, y + 4, "", DIM, "st_" + a["uid"])
+            rows[a["uid"]] = "st_" + a["uid"]
+            x = x0 + 28 + CW * 50
+            x = rbtn("Launch", lambda u=a["uid"]: watcher.launch_now(u), x, y)
+            x = rbtn("Server", lambda a=a: server_dialog(a), x, y)
+            x = rbtn("Close", lambda u=a["uid"]: watcher.close(u), x, y)
+            rbtn("x", lambda a=a: remove(a), x, y)
+            y += bh + 4
+        if store.settings.get("show_log", True):
+            y += 10
+            text(x0, y + 4, "log:", T["fg"], "log_h")
+            rbtn("clear", clear_log, x0 + FNT.measure("log: ") + 6, y)
+            y += bh + 6
+            log_view["y"] = y
+            text(x0, y, "", DIM, "logtxt")
+            draw_log()
+
+    def draw_log():
+        if not store.settings.get("show_log", True) or not log_view["y"]:
+            return
+        h = max(cv.winfo_height(), root.winfo_height())
+        n = max(1, (h - log_view["y"] - 10) // LH)
+        set_text("logtxt", "\n".join(log_view["lines"][-n:]))
 
     def clear_log():
-        log_box.configure(state="normal")
-        log_box.delete("1.0", "end")
-        log_box.configure(state="disabled")
-    btn(logbar, "clear", clear_log).pack(side="right")
-    log_box = tk.Text(root, bg=BG, fg=DIM, font=FONT, relief="solid", bd=1, height=12,
-                      highlightthickness=0, state="disabled")
-    if bg_label:
-        log_box.configure(height=8, width=78)
-        log_box.pack(anchor="w", padx=10, pady=(0, 10))
-    else:
-        log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-    if not store.settings.get("show_log", True):
-        logbar.pack_forget()
-        log_box.pack_forget()
-    shown = [0]
+        log_view["lines"].clear()
+        draw_log()
 
     def color(s):
         if s == "OK":
@@ -671,35 +664,81 @@ def app_mode():
 
     def refresh():
         on = watcher.alive
-        status_lbl.configure(text="status: running" if on else "status: stopped")
-        start_btn.configure(text="Stop" if on else "Start")
-        s = store.settings
-        game = "bee swarm" if s["place"] == core.BEE_SWARM else f"place {s['place']}"
-        info_lbl.configure(text=f"{game} | {'private server' if s.get('ps_raw') else 'public'} | "
-                                f"{len(s['hb_dirs'])} hb folder(s)")
-        key = ",".join(a["uid"] for a in store.accounts)
+        key = ",".join(a["uid"] for a in store.accounts) + "|" + T["fg"]
         if key != rows_key[0]:
             rows_key[0] = key
-            build_rows()
+            layout()
+        set_text("status", "status: running" if on else "status: stopped")
+        if start_btn.cget("text") != ("Stop" if on else "Start"):
+            start_btn.configure(text="Stop" if on else "Start")
+        s = store.settings
+        game = "bee swarm" if s["place"] == core.BEE_SWARM else f"place {s['place']}"
+        set_text("info", f"{game} | {'private server' if s.get('ps_raw') else 'public'} | {len(s['hb_dirs'])} hb folder(s)")
         for a in store.accounts:
-            st = rows.get(a["uid"])
-            if st is None:
+            tag = rows.get(a["uid"])
+            if tag is None:
                 continue
-            text = watcher.status.get(a["uid"], "not started")
+            t = watcher.status.get(a["uid"], "not started")
             if not a.get("enabled", True):
-                text = "off"
-            elif not on and not text.startswith("login expired"):
-                text = "not watching"
+                t = "off"
+            elif not on and not t.startswith("login expired"):
+                t = "not watching"
             r = watcher.restarts.get(a["uid"], 0)
-            st.configure(text=f"{text} ({r} restarts)" if r else text, fg=color(text))
+            set_text(tag, f"{t} ({r} restarts)" if r else t, color(t))
         with lock:
             new = [t for n, t in lines if n > shown[0]]
             shown[0] = count[0]
         if new:
-            log_box.configure(state="normal")
-            log_box.insert("end", "\n".join(new) + "\n")
-            log_box.see("end")
-            log_box.configure(state="disabled")
+            log_view["lines"].extend(new)
+            del log_view["lines"][:-300]
+            draw_log()
+
+    bg_state = {"size": None, "job": None}
+
+    def fit_bg():
+        if not PIC:
+            return
+        try:
+            w, h = root.winfo_width(), root.winfo_height()
+            if w < 50 or h < 50:
+                root.after(200, fit_bg)
+                return
+            if bg_state["size"] == (w, h):
+                return
+            bg_state["size"] = (w, h)
+            mode = store.settings.get("bg_mode", "fill")
+            if mode == "stretch":
+                out = bg_src.resize((w, h))
+            elif mode in ("fit", "center"):
+                out = Image.new("RGB", (w, h), BG)
+                r = min(w / bg_src.width, h / bg_src.height) if mode == "fit" else min(1.0, w / bg_src.width, h / bg_src.height)
+                im = bg_src.resize((max(1, int(bg_src.width * r)), max(1, int(bg_src.height * r))))
+                out.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
+            elif mode == "tile":
+                out = Image.new("RGB", (w, h), BG)
+                for yy in range(0, h, bg_src.height):
+                    for xx in range(0, w, bg_src.width):
+                        out.paste(bg_src, (xx, yy))
+            else:                                                     # fill: cover the window, crop the rest
+                r = max(w / bg_src.width, h / bg_src.height)
+                im = bg_src.resize((int(bg_src.width * r) + 1, int(bg_src.height * r) + 1))
+                l, t = (im.width - w) // 2, (im.height - h) // 2
+                out = im.crop((l, t, l + w, t + h))
+            cache = os.path.join(core.DATA_DIR, "background_fit.png")
+            out.save(cache)
+            cv.img = tk.PhotoImage(file=cache)                       # Tk reads PNG itself
+            cv.itemconfigure(bg_item, image=cv.img)
+            cv.tag_lower(bg_item)
+        except Exception as e:
+            log(f"background picture failed: {e}")
+
+    def on_resize(e):
+        if e.widget is root:
+            if bg_state["job"]:
+                root.after_cancel(bg_state["job"])
+            bg_state["job"] = root.after(150, lambda: (fit_bg(), draw_log()))
+    root.bind("<Configure>", on_resize, add="+")
+    root.after(300, fit_bg)
 
     def tick():
         refresh()
