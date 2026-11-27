@@ -536,6 +536,8 @@ def app_mode(resume=False):
         rt = entry("free up roblox ram every (minutes)", s.get("ram_trim", 0))
         rl = entry("restart an account using more ram than (MB, e.g. 2500)", s.get("ram_limit", 0))
         cc = entry("cpu limit per roblox window (% of the whole cpu, e.g. 10)", s.get("cpu_cap", 0))
+        mt = entry("slow a window down while it uses more ram than (MB, e.g. 2560)", s.get("mem_throttle", 0))
+        tc = entry("cpu limit while slowed down (%, e.g. 10)", s.get("throttle_cpu", 10))
         srow = tk.Frame(d, bg=BG)
         srow.pack(anchor="w", padx=10, pady=(6, 0))
         lbl(srow, "roblox window size: ").pack(side="left")
@@ -562,7 +564,8 @@ def app_mode(resume=False):
                            boot_wait=max(60, int(bw.get())), hop_wait=max(10, int(hw.get())),
                            status_every=max(30, int(every.get())), fps_cap=max(0, int(fc.get())),
                            ram_trim=max(0, int(rt.get())), ram_limit=max(0, int(rl.get())),
-                           cpu_cap=max(0, min(100, int(cc.get()))))
+                           cpu_cap=max(0, min(100, int(cc.get()))), mem_throttle=max(0, int(mt.get())),
+                           throttle_cpu=max(1, min(100, int(tc.get()))))
             except ValueError:
                 messagebox.showerror("NovaHop Rejoin", "timings and performance boxes have to be numbers, nothing saved", parent=win)
                 return
@@ -825,7 +828,7 @@ def app_mode(resume=False):
     FNT_S = tkfont.Font(family="Consolas", size=9)
     card_seen = {}          # tag -> last value, so unchanged parts are never redrawn
     avatars = {}            # uid -> PhotoImage (made once)
-    PERF = ("fps_cap", "low_gfx", "eco", "ram_trim", "cpu_cap")
+    PERF = ("fps_cap", "low_gfx", "eco", "ram_trim", "cpu_cap", "mem_throttle")
     menu = tk.Menu(root, tearoff=0, bg=BTN, fg="#FFFFFF", activebackground=DIM, font=FONT)
 
     def columns():

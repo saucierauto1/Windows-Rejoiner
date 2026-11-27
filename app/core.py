@@ -86,6 +86,7 @@ if IS_WIN:
                        ("GetWindowRect", wintypes.BOOL, [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]),
                        ("SetForegroundWindow", wintypes.BOOL, [wintypes.HWND]),
                        ("GetWindow", wintypes.HWND, [wintypes.HWND, ctypes.c_uint]),
+                       ("GetClassNameW", ctypes.c_int, [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]),
                        ("ShowWindow", wintypes.BOOL, [wintypes.HWND, ctypes.c_int]),
                        ("SetWindowPos", wintypes.BOOL, [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                                         ctypes.c_int, ctypes.c_int, ctypes.c_uint])):
@@ -144,7 +145,8 @@ class Store:
                      ("mouse_lock", False), ("mouse_key", "ctrl+alt+l"),
                      ("boot_wait", BOOT_WAIT), ("fps_cap", 0), ("ram_trim", 0), ("ram_limit", 0), ("ax_dirs", []),
                      ("low_gfx", False), ("eco", False), ("cpu_cap", 0), ("flag_backup", {}), ("read_logs", False),
-                     ("win_start", False), ("hide_on", False), ("hide_key", "ctrl+alt+h")):
+                     ("win_start", False), ("hide_on", False), ("hide_key", "ctrl+alt+h"),
+                     ("mem_throttle", 0), ("throttle_cpu", 10)):
             self.settings.setdefault(k, v)
         self.settings.setdefault("win_size", "small" if self.settings.pop("shrink", False) else "normal")
 
@@ -689,9 +691,18 @@ def close_job(job):
 
 
 def ram_mb(pid):
+    """memory the window has claimed (commit): what the RAM limit and the throttle look at"""
     try:
         mi = psutil.Process(pid).memory_info()
         return int(getattr(mi, "private", mi.rss) / 1048576)
+    except (psutil.Error, OSError):
+        return 0
+
+
+def ram_in_use(pid):
+    """memory the window has in RAM right now (working set, like Task Manager): what the cards show, drops after a trim"""
+    try:
+        return int(psutil.Process(pid).memory_info().rss / 1048576)
     except (psutil.Error, OSError):
         return 0
 
@@ -841,8 +852,8 @@ def roblox_updating():
     return False
 
 
-def windows_of(pids, visible=True):
-    """top-level windows of these processes -> [(hwnd, pid)]"""
+def windows_of(pids, visible=True, owned=False):
+    """top-level windows of these processes -> [(hwnd, pid)] (owned=True also gives dialogs that belong to a window)"""
     if not IS_WIN:
         return []
     pids = set(pids)
@@ -851,11 +862,20 @@ def windows_of(pids, visible=True):
     def each(hwnd, _):
         owner = wintypes.DWORD()
         _u.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-        if owner.value in pids and bool(_u.IsWindowVisible(hwnd)) == visible and not _u.GetWindow(hwnd, 4):  # 4 = owner
+        if owner.value in pids and bool(_u.IsWindowVisible(hwnd)) == visible and (owned or not _u.GetWindow(hwnd, 4)):
             found.append((hwnd, owner.value))
         return True
     _u.EnumWindows(WNDENUMPROC(each), 0)
     return found
+
+
+def error_boxes(pids):
+    """Roblox processes showing a Windows message box (e.g. the "Roblox" box with Retry / Cancel when a launch
+    fails, or a crash box): such a window never gets into the game by itself"""
+    if not IS_WIN:
+        return set()
+    buf = ctypes.create_unicode_buffer(32)
+    return {pid for h, pid in windows_of(pids, owned=True) if _u.GetClassNameW(h, buf, 32) and buf.value == "#32770"}
 
 
 SIZES = {"small": (640, 400), "micro": (320, 200)}
@@ -1023,6 +1043,11 @@ class Watcher:
         self.cpu_of = cpu_pct
         self.win_min = is_minimized
         self.fit = fit_window
+        self.boxes = error_boxes
+        self.ws = ram_in_use
+        self.trim = trim_ram
+        self.throttled = set()   # pids slowed down because they're over the memory throttle
+        self.trimmed = set()     # pids already trimmed once after loading
         self.cpu = {}         # uid -> % of the whole CPU, for the cards
         self.minimized = {}   # uid -> its window is minimized
         self.limited = {}     # pid -> (eco, cpu) already set on that window
@@ -1177,6 +1202,8 @@ class Watcher:
                 del self.limited[pid]
             self.tamed &= live
             self.cpu_warned &= live
+            self.throttled &= live
+            self.trimmed &= live
             forget_cpu(live)
             uids = {a["uid"] for a in self.store.accounts}
             for d in (self.ram, self.cpu, self.minimized, self.status, self.beats, self.last, self.fails, self.err_since, self.err_msg,
@@ -1540,6 +1567,17 @@ class Watcher:
                 self.beats[uid] = b      # a file being rewritten right now keeps its last good read
         events = self._log_events() if s.get("read_logs") else {}
 
+        # Roblox's own Windows error boxes (Retry / Cancel after a failed launch, crash boxes): a box nobody owns
+        # is a dead launch taking up a window slot, so it's closed; an account's own box counts as an error below
+        boxes = self.boxes([p[0] for p in procs]) if procs else set()
+        with self.lock:
+            stray = boxes - set(self.pids.values())
+        if stray:
+            for pid in stray:
+                self.kill(pid)
+            self.log(f"closed {len(stray)} roblox error box(es) from launches that failed")
+            procs = [p for p in procs if p[0] not in stray]
+
         upd = self.is_updating()
         if upd != self.updating:
             self.updating = upd
@@ -1569,14 +1607,28 @@ class Watcher:
                 continue
             with self.lock:
                 pid = self.pids.get(uid)
+            commit = None
             if pid:
                 self.unknown.discard(uid)
-                self.ram[uid] = self.mem(pid)
+                commit = self.mem(pid)
+                self.ram[uid] = self.ws(pid)
                 self.cpu[uid] = self.cpu_of(pid)
                 self.minimized[uid] = self.win_min(pid)
                 if self.last.get(uid) and now - self.last[uid] < 180:
                     self._tame(pid)
-                want = (bool(s.get("eco")), int(s.get("cpu_cap", 0)))
+                # throttle on high memory: over the limit -> held to the throttle cpu limit (tightens, never loosens
+                # the normal cpu limit), back to normal once under 90 % of it. It slows the window, it frees nothing.
+                thr, cpu = int(s.get("mem_throttle", 0)), int(s.get("cpu_cap", 0))
+                if thr and commit > thr:
+                    if pid not in self.throttled:
+                        self.throttled.add(pid)
+                        self.log(f"{name}: using {commit} MB, slowing it down")
+                elif not thr or commit < thr * 0.9:
+                    self.throttled.discard(pid)
+                if pid in self.throttled:
+                    tc = int(s.get("throttle_cpu", 10))
+                    cpu = min(cpu, tc) if cpu else tc
+                want = (bool(s.get("eco")), cpu)
                 if self.limited.get(pid) != want and (want != (False, 0) or pid in self.limited):
                     ok_eco, ok_cpu = self.limit(pid, want[0], want[1], self.jobs)
                     self.limited[pid] = want         # tried: don't hammer a window that refuses
@@ -1592,7 +1644,8 @@ class Watcher:
             last = self.last.get(uid)
             # a fresh heartbeat written after this launch = it's in game, no need to sit out the whole loading time
             loaded = hb is not None and last is not None and hb[0] > last and age < 20 and hb[1] != "error"
-            booting = last is not None and now - last < self.boot_wait() and not loaded
+            boxed = pid is not None and pid in boxes      # an error box never loads: don't wait the loading time out
+            booting = last is not None and now - last < self.boot_wait() and not loaded and not boxed
             f = self.fails.get(uid, 0)
             ev = events.get(uid)
             if ev and last and ev[1] < last - 5:
@@ -1648,7 +1701,9 @@ class Watcher:
 
             # an error screen from the heartbeat, or a disconnect in Roblox's own log
             err, from_log = None, False
-            if hb and age < stale and hb[1] == "error":
+            if boxed:
+                err, from_log = "roblox error box (launch failed or crashed)", True
+            elif hb and age < stale and hb[1] == "error":
                 err = hb[2] or "error"
             elif ev and ev[0] == "disconnect" and not (hb and age < 30 and hb[1] != "error"):
                 err, from_log = REASONS.get(ev[2], "disconnected"), True
@@ -1696,9 +1751,12 @@ class Watcher:
                 size = SIZES.get(s.get("win_size"))
                 if size and pid and not self.minimized.get(uid):
                     self.fit(pid, size)            # Roblox can grow a window back after a teleport
+                if pid and int(s.get("ram_trim", 0)) > 0 and pid not in self.trimmed:
+                    self.trimmed.add(pid)
+                    self.trim(pid)                 # loading leaves the most unused memory behind: trim it right away
                 limit = int(s.get("ram_limit", 0))
                 if limit > 0 and pid:
-                    mb = self.ram.get(uid) or self.mem(pid)
+                    mb = commit
                     h = self.ram_hits.get(uid, 0)
                     if mb <= limit:
                         if last is None or now - last >= RETRY:
