@@ -76,6 +76,7 @@ if IS_WIN:
                        ("SetPriorityClass", wintypes.BOOL, [H, wintypes.DWORD]),
                        ("SetProcessInformation", wintypes.BOOL, [H, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]),
                        ("K32EmptyWorkingSet", wintypes.BOOL, [H]),
+                       ("K32GetProcessMemoryInfo", wintypes.BOOL, [H, wintypes.LPVOID, wintypes.DWORD]),
                        ("CreateMutexW", H, [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR])):
         getattr(_k, _n).restype, getattr(_k, _n).argtypes = _r, _a
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -700,8 +701,26 @@ def ram_mb(pid):
 
 
 def ram_in_use(pid):
-    """memory the window has in RAM right now (working set, like Task Manager): what the cards show, drops after a trim"""
-    try:
+    """memory only this window has in RAM right now (private working set: Task Manager's "Memory" column, without
+    Windows' shared files): what the cards show, drops after a trim"""
+    if IS_WIN:
+        class MEM(ctypes.Structure):      # PROCESS_MEMORY_COUNTERS_EX2 (Windows 10 1803+)
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + \
+                       [(n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                                                       "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                                                       "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+                                                       "PrivateUsage", "PrivateWorkingSetSize")] + \
+                       [("SharedCommitUsage", ctypes.c_uint64)]
+        h = _k.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+        if h:
+            try:
+                m = MEM()
+                m.cb = ctypes.sizeof(MEM)
+                if _k.K32GetProcessMemoryInfo(h, ctypes.byref(m), m.cb):
+                    return int(m.PrivateWorkingSetSize / 1048576)
+            finally:
+                _k.CloseHandle(h)
+    try:      # older Windows: the whole working set
         return int(psutil.Process(pid).memory_info().rss / 1048576)
     except (psutil.Error, OSError):
         return 0
