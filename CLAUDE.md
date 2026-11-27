@@ -30,7 +30,9 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
   (a second copy writes `show.flag` in the data folder and exits; the running copy sees it and shows its window),
   then runs itself with `--child` (the real app window) and runs it again with `--resume` if it crashes (Tk can kill
   the whole process on "Tk_GetPixmap ... CreateDIBSection" when RAM is low; `watching.flag` = it was watching, so it
-  starts watching again). Exit code 0 = quit, 5 = reopen (new look). More than 5 crashes in 10 min = give up.
+  starts watching again). Tk's own fatal-error box would keep the dead child alive, so the child sets
+  `Tcl_SetPanicProc` (`_exit_on_tk_panic`): log the message, exit code 3. Tested with a real `Tcl_Panic` on Tk 9.0.
+  Exit code 0 = quit, 5 = reopen (new look). More than 5 crashes in 10 min = give up.
   The child: tkinter UI, main screen is one Canvas (text drawn onto the background picture with a 1 px shadow,
   picture never bigger than the screen), buttons via create_window. Dialogs: game/server, folders, settings
   (scrollable, all-or-nothing save, performance preset dropdown, export/import, open log folder), look,

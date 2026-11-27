@@ -63,6 +63,29 @@ def login_mode(out_file):
 
 
 # ------------------------------------------------------------------ app window
+_panic_cb = None
+
+
+def _exit_on_tk_panic(fn):
+    """Tk's fatal errors ("Tk_GetPixmap: Error from CreateDIBSection") show a box that waits for a click, which
+    keeps the dead window's process alive. Run fn instead (log + exit), so the supervisor opens the window again."""
+    global _panic_cb
+    import ctypes
+    import glob
+    import re
+    import _tkinter
+    for d in {os.path.dirname(_tkinter.__file__), getattr(sys, "_MEIPASS", "")}:
+        for f in glob.glob(os.path.join(d, "tcl*.dll")):
+            if re.fullmatch(r"tcl\d+t?\.dll|tcl9tcl\d+\.dll", os.path.basename(f), re.I):
+                try:
+                    _panic_cb = ctypes.CFUNCTYPE(None, ctypes.c_char_p)(fn)
+                    ctypes.CDLL(f).Tcl_SetPanicProc(_panic_cb)
+                    return True
+                except (OSError, AttributeError):
+                    pass
+    return False
+
+
 def app_mode(resume=False):
     import tkinter as tk
     from tkinter import filedialog, messagebox
@@ -111,6 +134,19 @@ def app_mode(resume=False):
     root.geometry("760x640")
     root.configure(bg=BG)
     root.report_callback_exception = lambda kind, val, tb: log(f"screen problem (watching goes on): {val!r}")
+
+    def on_panic(msg):
+        try:
+            with open(os.path.join(LOG_DIR, time.strftime("rejoin-%Y-%m-%d.txt")), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%H:%M:%S ") + "the app window crashed ("
+                        + (msg or b"").decode("utf-8", "ignore") + "), opening it again\n")
+        finally:
+            os._exit(3)
+    try:
+        if not _exit_on_tk_panic(on_panic):
+            log("note: couldn't set up the crash catcher, a screen crash may show an error box")
+    except Exception as e:
+        log(f"note: couldn't set up the crash catcher ({e})")
     try:
         root.attributes("-alpha", max(0.4, min(1.0, float(store.settings.get("alpha", 1.0)))))
     except Exception:
