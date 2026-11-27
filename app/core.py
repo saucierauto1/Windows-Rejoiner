@@ -560,6 +560,14 @@ LOW_FLAGS = {"DFIntCSGLevelOfDetailSwitchingDistance": "0", "DFIntCSGLevelOfDeta
              "FIntFRMMaxGrassDistance": "0", "DFIntDebugFRMQualityLevelOverride": "1"}
 
 
+def fps_lua(cap):
+    """capped while in a server, uncapped while teleporting so hops load at full speed
+    (the executor runs autoexec again on the new server, which caps it again once it has loaded)"""
+    return ("if setfpscap then task.spawn(function() if not game:IsLoaded() then game.Loaded:Wait() end "
+            f"task.wait(5) setfpscap({cap}) game:GetService(\"Players\").LocalPlayer.OnTeleport:Connect(function(s) "
+            f"if s == Enum.TeleportState.Failed then setfpscap({cap}) else setfpscap(240) end end) end) end\n")
+
+
 def _client_settings_dirs():
     """Roblox's ClientSettings folders (every installed version, plus Bloxstrap / Fishstrap)"""
     out = []
@@ -589,7 +597,7 @@ def apply_fps(cap, autoexecs, low=False, backup=None):
         try:
             if cap > 0:
                 with open(f, "w", encoding="utf-8") as fh:
-                    fh.write(f"if setfpscap then setfpscap({cap}) end\n")
+                    fh.write(fps_lua(cap))
                 n += 1
             elif os.path.exists(f):
                 os.remove(f)
@@ -607,7 +615,7 @@ def apply_fps(cap, autoexecs, low=False, backup=None):
             old = dict(data)
             mine = backup.setdefault(f, {})
             want = dict(LOW_FLAGS) if low else {}
-            if cap > 0:
+            if cap > 0 and n == 0:     # Roblox's own cap also slows loading, so only when no executor can cap it
                 want[FPS_FLAG] = str(cap)
             for k in [FPS_FLAG, *LOW_FLAGS]:
                 if k in want:
@@ -1030,10 +1038,12 @@ class Watcher:
             self.log(f"couldn't write the fps / graphics settings: {e}")
             return
         if cap > 0 and not quiet:
-            self.log(f"fps cap {cap} set ({n} executor autoexec folder(s) + roblox settings), "
-                     "windows opened from now on use it")
-            if not s.get("ax_dirs"):
-                self.log("no executor autoexec folder known yet: press Scan in Folders so the executor caps it too")
+            if n:
+                self.log(f"fps cap {cap} set in {n} executor autoexec folder(s): capped in game, full speed while "
+                         "hopping. windows opened from now on use it")
+            else:
+                self.log(f"fps cap {cap} set in roblox's own settings (this also slows hops down a bit). press Scan "
+                         "in Folders so the executor caps it instead")
 
     def _ram_loop(self, g):
         waited = 0
@@ -1048,8 +1058,8 @@ class Watcher:
                 if waited < mins * 60:
                     continue
                 waited = 0
-                with self.lock:
-                    pids = set(self.pids.values())
+                with self.lock:     # only accounts in game: trimming one that's loading / hopping slows it down
+                    pids = {pid for uid, pid in self.pids.items() if self.status.get(uid) == "OK"}
                 n = sum(1 for pid in pids if trim_ram(pid))
                 if n:
                     self.log(f"trimmed ram of {n} roblox window(s)")
