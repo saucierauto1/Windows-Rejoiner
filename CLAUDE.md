@@ -77,9 +77,12 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
   the executor (a fresh ok heartbeat wins); 264/273 (same account elsewhere) and 285 (left on purpose) put the
   account on hold (no rejoin until Launch is pressed or it joins again); a recent teleport stops "no heartbeat"
   restarts for hop_wait. The log line formats are guesses from Bloxstrap's watcher: check them on a real PC.
-- Performance (all off by default): fps_cap (executor autoexec `novahop_fps.lua` with setfpscap + Roblox
-  ClientAppSettings.json DFIntTaskSchedulerTargetFps), low_gfx (allowlisted lowest-graphics flags, also written to
-  Bloxstrap/Fishstrap Modifications), ram_trim minutes (K32EmptyWorkingSet), ram_limit MB, eco (below-normal
+- Performance (all off by default): fps_cap (executor autoexec `novahop_fps.lua` from `fps_lua()`: caps 5 s after
+  the game loaded, uncaps to 240 on LocalPlayer.OnTeleport so hops load at full speed, caps again on a failed
+  teleport; autoexec runs again on the new server. Roblox's own DFIntTaskSchedulerTargetFps is only written when no
+  autoexec folder could be written, because it caps loading too), low_gfx (allowlisted lowest-graphics flags, also written to
+  Bloxstrap/Fishstrap Modifications), ram_trim minutes (K32EmptyWorkingSet, only accounts with status OK so a
+  loading / hopping window isn't slowed down), ram_limit MB, eco (below-normal
   priority + EcoQoS + very low memory priority), cpu_cap % (job object hard cap; tried once per window, job handles
   closed when the window closes). Flags are written again before every launch (a Roblox update makes a new
   folder); `flag_backup` remembers the user's own values, which are put back when a setting is turned off.
