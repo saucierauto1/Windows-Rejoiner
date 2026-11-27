@@ -36,6 +36,59 @@ def parse_hotkey(text):
     return mods, vk
 
 
+class Hotkey:
+    """one more global hotkey that runs a function (hide / show all roblox windows)"""
+
+    def __init__(self, log, name, action):
+        self.log = log
+        self.name = name
+        self.action = action
+        self._tid = None
+
+    def start(self, hotkey):
+        self.stop()
+        if not IS_WIN:
+            return False
+        parsed = parse_hotkey(hotkey)
+        if not parsed:
+            self.log(f"{self.name}: didn't understand the hotkey '{hotkey}'")
+            return False
+        ok = threading.Event()
+        res = {}
+
+        def loop():
+            import ctypes
+            from ctypes import wintypes
+            u, k = ctypes.windll.user32, ctypes.windll.kernel32
+            self._tid = k.GetCurrentThreadId()
+            res["ok"] = bool(u.RegisterHotKey(None, 2, parsed[0] | 0x4000, parsed[1]))
+            ok.set()
+            if not res["ok"]:
+                return
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == 0x0312:        # WM_HOTKEY
+                    try:
+                        self.action()
+                    except Exception as e:
+                        self.log(f"{self.name}: {e}")
+            u.UnregisterHotKey(None, 2)
+
+        threading.Thread(target=loop, daemon=True).start()
+        ok.wait(3)
+        if res.get("ok"):
+            self.log(f"{self.name}: press {hotkey}")
+            return True
+        self.log(f"{self.name}: {hotkey} is already used by another program, pick another key in Settings")
+        return False
+
+    def stop(self):
+        if IS_WIN and self._tid:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self._tid, 0x0012, 0, 0)   # WM_QUIT
+        self._tid = None
+
+
 class MouseLock:
     def __init__(self, log):
         self.log = log

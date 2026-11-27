@@ -63,7 +63,7 @@ def login_mode(out_file):
 
 
 # ------------------------------------------------------------------ app window
-def app_mode():
+def app_mode(resume=False):
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
@@ -78,20 +78,39 @@ def app_mode():
     lines = []
     lock = threading.Lock()
     count = [0]
+    LOG_DIR = os.path.join(core.DATA_DIR, "logs")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    for f in os.listdir(LOG_DIR):          # keep the last few days
+        p = os.path.join(LOG_DIR, f)
+        try:
+            if time.time() - os.path.getmtime(p) > 4 * 86400:
+                os.remove(p)
+        except OSError:
+            pass
 
     def log(msg):
         with lock:
             count[0] += 1
             lines.append((count[0], time.strftime("[%H:%M:%S] ") + msg))
             del lines[:-300]
+            try:
+                with open(os.path.join(LOG_DIR, time.strftime("rejoin-%Y-%m-%d.txt")), "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+            except OSError:
+                pass
 
+    threading.excepthook = lambda a: log(f"problem in a background task: {a.exc_value!r}")
     watcher = core.Watcher(store, log)
     mlock = mouselock.MouseLock(log)
+    hider = mouselock.Hotkey(log, "hide roblox", watcher.toggle_hidden)
+    show_flag = os.path.join(core.DATA_DIR, "show.flag")
+    running_flag = os.path.join(core.DATA_DIR, "watching.flag")
 
     root = tk.Tk()
     root.title("NovaHop Rejoin")
     root.geometry("760x640")
     root.configure(bg=BG)
+    root.report_callback_exception = lambda kind, val, tb: log(f"screen problem (watching goes on): {val!r}")
     try:
         root.attributes("-alpha", max(0.4, min(1.0, float(store.settings.get("alpha", 1.0)))))
     except Exception:
@@ -106,6 +125,7 @@ def app_mode():
         try:
             from PIL import Image
             bg_src = Image.open(bg_path).convert("RGB")
+            bg_src.thumbnail((root.winfo_screenwidth(), root.winfo_screenheight()))   # never bigger than the screen
         except Exception as e:
             log(f"background picture failed: {e}")
     PIC = bg_src is not None
@@ -137,9 +157,8 @@ def app_mode():
     bar_btns = []
 
     def text(x, y, s, fill, tag):
-        if PIC:   # dark outline so text stays readable on any picture
-            for dx, dy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
-                cv.create_text(x + dx, y + dy, text=s, anchor="nw", font=FNT, fill="#000000", tags=(tag, "txt"))
+        if PIC:   # dark shadow so text stays readable on any picture
+            cv.create_text(x + 1, y + 1, text=s, anchor="nw", font=FNT, fill="#000000", tags=(tag, "txt"))
         cv.create_text(x, y, text=s, anchor="nw", font=FNT, fill=fill, tags=(tag, tag + "_fg", "txt"))
 
     drawn = {}
@@ -155,11 +174,16 @@ def app_mode():
     def toggle():
         if watcher.alive:
             watcher.stop()
+            try:
+                os.remove(running_flag)
+            except OSError:
+                pass
         else:
             if not store.accounts:
                 messagebox.showinfo("NovaHop Rejoin", "add an account first")
                 return
             watcher.start()
+            open(running_flag, "w").close()    # after a crash the app starts watching again by itself
         refresh()
 
     start_btn = btn(cv, "Start", toggle, 8)
@@ -324,6 +348,10 @@ def app_mode():
                 pass
             recolor(w, old, new)
 
+    PRESETS = {"off": dict(fps_cap=0, low_gfx=False, eco=False, ram_trim=0, ram_limit=0, cpu_cap=0),
+               "balanced": dict(fps_cap=30, low_gfx=False, eco=True, ram_trim=15, ram_limit=0, cpu_cap=0),
+               "max alts": dict(fps_cap=15, low_gfx=True, eco=True, ram_trim=10, ram_limit=2500, cpu_cap=0)}
+
     def settings_dialog():
         win = popup("Settings", "540x760")
         sc = tk.Canvas(win, bg=BG, highlightthickness=0)
@@ -336,6 +364,7 @@ def app_mode():
         d.bind("<Configure>", lambda e: sc.configure(scrollregion=sc.bbox("all")))
         win.bind("<MouseWheel>", lambda e: sc.yview_scroll(int(-e.delta / 120), "units"))
         s = store.settings
+        cv_ = {}
 
         def head(t):
             lbl(d, t, fg=DIM).pack(anchor="w", padx=10, pady=(12, 0))
@@ -351,6 +380,7 @@ def app_mode():
             v = tk.IntVar(value=1 if s.get(key) else 0)
             tk.Checkbutton(d, text=t, variable=v, bg=BG, fg=T["fg"], activebackground=BG, activeforeground=T["fg"],
                            selectcolor=BG, font=FONT, anchor="w").pack(anchor="w", padx=6)
+            cv_[key] = v
             return key, v
 
         head("-- discord webhook --")
@@ -363,27 +393,36 @@ def app_mode():
                   check("live status message (accounts, ram, cpu)", "wh_status")]
         every = entry("update the status every (seconds, min 30)", s.get("status_every", 60))
 
-        head("-- mouse lock --")
-        checks += [check("hotkey locks the mouse to the monitor it's on", "mouse_lock")]
-        mk = entry("hotkey (e.g. ctrl+alt+l, f8, ctrl+shift+m)", s.get("mouse_key", "ctrl+alt+l"))
-
         def test():
             url = wh.get().strip()
             if not core.is_webhook(url):
                 messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=win)
                 return
-            try:
-                core.send_webhook(url, "NovaHop Rejoin test message")
-                messagebox.showinfo("NovaHop Rejoin", "sent, check your discord", parent=win)
-            except Exception as e:
-                messagebox.showerror("NovaHop Rejoin", f"failed: {e}", parent=win)
+
+            def go():
+                try:
+                    core.send_webhook(url, "NovaHop Rejoin test message")
+                    msg = (messagebox.showinfo, "sent, check your discord")
+                except Exception as e:
+                    msg = (messagebox.showerror, f"failed: {e}")
+                root.after(0, lambda: msg[0]("NovaHop Rejoin", msg[1], parent=win) if win.winfo_exists() else None)
+            threading.Thread(target=go, daemon=True).start()
         btn(d, "Test webhook", test).pack(anchor="w", padx=10, pady=4)
+
+        head("-- hotkeys --")
+        checks += [check("hotkey locks the mouse to the monitor it's on", "mouse_lock")]
+        mk = entry("mouse lock hotkey (e.g. ctrl+alt+l, f8, ctrl+shift+m)", s.get("mouse_key", "ctrl+alt+l"))
+        checks += [check("hotkey hides / shows all roblox windows", "hide_on")]
+        hk = entry("hide hotkey (e.g. ctrl+alt+h)", s.get("hide_key", "ctrl+alt+h"))
 
         head("-- app --")
         checks += [check("start watching when the app opens", "autostart"),
+                   check("start the app with windows", "win_start"),
                    check("keep window on top", "on_top"),
                    check("minimize to the tray (next to the clock)", "tray"),
                    check("open roblox windows minimized (they won't steal focus)", "launch_min"),
+                   check("make roblox windows small (640x400, less ram & gpu)", "shrink"),
+                   check("also read roblox's own logs (catches kicks / disconnects without the executor)", "read_logs"),
                    check("check for updates when the app opens", "update_check")]
         lbl(d, "text colour").pack(anchor="w", padx=10, pady=(4, 0))
         cur = next((k for k, v in COLORS.items() if v.upper() == T["fg"].upper()), "white")
@@ -394,6 +433,44 @@ def app_mode():
         om["menu"].configure(bg=BTN, fg="#FFFFFF", font=FONT)
         om.pack(anchor="w", padx=10)
 
+        def export():
+            f = filedialog.asksaveasfilename(parent=win, title="save settings and accounts",
+                                             initialfile="novahop-rejoin-backup.json",
+                                             defaultextension=".json", filetypes=[("backup", "*.json")])
+            if not f:
+                return
+            try:
+                store.export(f)
+                messagebox.showinfo("NovaHop Rejoin", "saved. the logins in it only work on this windows account: "
+                                    "on a new pc you log in again. don't send this file to anyone.", parent=win)
+            except Exception as e:
+                messagebox.showerror("NovaHop Rejoin", f"couldn't save it: {e}", parent=win)
+
+        def import_():
+            f = filedialog.askopenfilename(parent=win, title="pick a novahop rejoin backup",
+                                           filetypes=[("backup", "*.json")])
+            if not f:
+                return
+            try:
+                n, relog = store.import_file(f)
+            except Exception as e:
+                messagebox.showerror("NovaHop Rejoin", f"couldn't read it: {e}", parent=win)
+                return
+            rows_key[0] = None
+            log(f"imported {n} account(s) and the settings")
+            msg = f"imported {n} account(s) and the settings."
+            if relog:
+                msg += ("\n\nthese logins were saved on another pc, so log in again with Add account:\n"
+                        + ", ".join(relog))
+            win.destroy()
+            messagebox.showinfo("NovaHop Rejoin", msg + "\n\nrestart the app to use the new look / hotkeys.")
+
+        row = tk.Frame(d, bg=BG)
+        row.pack(anchor="w", padx=10, pady=(6, 0))
+        btn(row, "Export settings & accounts", export).pack(side="left")
+        btn(row, "Import", import_).pack(side="left", padx=4)
+        btn(row, "Open log folder", lambda: os.startfile(LOG_DIR)).pack(side="left")
+
         head("-- restart timing (seconds) --")
         ew = entry("restart after an error screen stays up", s.get("error_wait", core.ERROR_WAIT))
         st = entry("restart after no heartbeat for", s.get("stale", core.STALE))
@@ -401,6 +478,25 @@ def app_mode():
         bw = entry("loading time after a launch (raise it if your executor injects slowly)", s.get("boot_wait", core.BOOT_WAIT))
 
         head("-- performance (0 = off) --")
+        prow = tk.Frame(d, bg=BG)
+        prow.pack(anchor="w", padx=10, pady=(4, 0))
+        lbl(prow, "preset: ").pack(side="left")
+        pre = tk.StringVar(value="pick one")
+
+        def use_preset(name):
+            for key, v in PRESETS[name].items():
+                if key in cv_:
+                    cv_[key].set(1 if v else 0)
+                else:
+                    e = {"fps_cap": fc, "ram_trim": rt, "ram_limit": rl, "cpu_cap": cc}[key]
+                    e.delete(0, "end")
+                    e.insert(0, str(v))
+        pm = tk.OptionMenu(prow, pre, *PRESETS, command=use_preset)
+        pm.configure(bg=BTN, fg=T["fg"], activebackground="#333333", activeforeground=T["fg"], relief="solid", bd=1,
+                     font=FONT, highlightthickness=0)
+        pm["menu"].configure(bg=BTN, fg="#FFFFFF", font=FONT)
+        pm.pack(side="left")
+        lbl(d, "(fills in the boxes below, you can still change them)", fg=DIM).pack(anchor="w", padx=10)
         fc = entry("fps cap for every roblox window (e.g. 15 or 30)", s.get("fps_cap", 0))
         rt = entry("free up roblox ram every (minutes)", s.get("ram_trim", 0))
         rl = entry("restart an account using more ram than (MB, e.g. 2500)", s.get("ram_limit", 0))
@@ -410,34 +506,48 @@ def app_mode():
                    check("efficiency mode: roblox windows get low priority so your pc stays smooth", "eco")]
 
         def save():
+            # check everything first: nothing is saved unless all of it is right
             url = wh.get().strip()
             if url and not core.is_webhook(url):
-                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url", parent=win)
+                messagebox.showerror("NovaHop Rejoin", "that doesn't look like a discord webhook url, nothing saved", parent=win)
                 return
             try:
-                e_w = max(5, int(ew.get())); s_t = max(30, int(st.get())); s["boot_wait"] = max(60, int(bw.get())); s["hop_wait"] = max(10, int(hw.get())); s["status_every"] = max(30, int(every.get()))
-                fps = max(0, int(fc.get())); s["ram_trim"] = max(0, int(rt.get())); s["ram_limit"] = max(0, int(rl.get())); s["cpu_cap"] = max(0, min(100, int(cc.get())))
+                new = dict(error_wait=max(5, int(ew.get())), stale=max(30, int(st.get())),
+                           boot_wait=max(60, int(bw.get())), hop_wait=max(10, int(hw.get())),
+                           status_every=max(30, int(every.get())), fps_cap=max(0, int(fc.get())),
+                           ram_trim=max(0, int(rt.get())), ram_limit=max(0, int(rl.get())),
+                           cpu_cap=max(0, min(100, int(cc.get()))))
             except ValueError:
-                messagebox.showerror("NovaHop Rejoin", "timings have to be numbers", parent=win)
+                messagebox.showerror("NovaHop Rejoin", "timings and performance boxes have to be numbers, nothing saved", parent=win)
                 return
-            if fps != int(s.get("fps_cap", 0)):
-                s["fps_cap"] = fps
-                threading.Thread(target=watcher.apply_fps, daemon=True).start()
             key = mk.get().strip().lower()
-            if not mouselock.parse_hotkey(key):
-                messagebox.showerror("NovaHop Rejoin", "didn't understand that hotkey. use something like ctrl+alt+l or f8", parent=win)
+            hkey = hk.get().strip().lower()
+            if not mouselock.parse_hotkey(key) or not mouselock.parse_hotkey(hkey):
+                messagebox.showerror("NovaHop Rejoin", "didn't understand a hotkey. use something like ctrl+alt+l or f8, "
+                                                       "nothing saved", parent=win)
                 return
-            s.update(webhook=url, wh_ping=ping.get().strip(), error_wait=e_w, stale=s_t, mouse_key=key)
-            for key, v in checks:
-                s[key] = bool(v.get())
-            if bool(s.get("low_gfx")) != low_was:
+            if key == hkey and cv_["mouse_lock"].get() and cv_["hide_on"].get():
+                messagebox.showerror("NovaHop Rejoin", "the two hotkeys have to be different, nothing saved", parent=win)
+                return
+            fps_changed = new["fps_cap"] != int(s.get("fps_cap", 0))
+            new.update(webhook=url, wh_ping=ping.get().strip(), mouse_key=key, hide_key=hkey)
+            for k, v in checks:
+                new[k] = bool(v.get())
+            if new["win_start"] != bool(s.get("win_start")):
+                try:
+                    core.set_autorun(new["win_start"])
+                except OSError as e:
+                    messagebox.showerror("NovaHop Rejoin", f"couldn't change start with windows: {e}", parent=win)
+                    new["win_start"] = bool(s.get("win_start"))
+            s.update(new)
+            if fps_changed or bool(s.get("low_gfx")) != low_was:
                 threading.Thread(target=watcher.apply_fps, daemon=True).start()
-            new = COLORS[col.get()]
-            if new.upper() != T["fg"].upper():
+            new_col = COLORS[col.get()]
+            if new_col.upper() != T["fg"].upper():
                 old = T["fg"]
-                T["fg"] = new
-                s["text_color"] = new
-                recolor(root, old, new)
+                T["fg"] = new_col
+                s["text_color"] = new_col
+                recolor(root, old, new_col)
                 rows_key[0] = None
             root.attributes("-topmost", bool(s.get("on_top")))
             store.save()
@@ -446,6 +556,10 @@ def app_mode():
             else:
                 mlock.stop_hotkey()
                 mlock.unlock()
+            if s.get("hide_on"):
+                hider.start(s["hide_key"])
+            else:
+                hider.stop()
             log("settings saved")
             win.destroy()
 
@@ -454,16 +568,9 @@ def app_mode():
 
     # ---------------- look: colours, background picture, see-through window
     def restart_app():
-        if getattr(sys, "frozen", False):
-            # a fully separate copy: without this it reuses (and then loses) this copy's unpacked files
-            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
-            for k in [k for k in env if k.startswith("_PYI") or k.startswith("_MEI")]:
-                env.pop(k)
-            subprocess.Popen([sys.executable], env=env, close_fds=True)
-        else:
-            subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+        hider.stop()
         root.destroy()
-        os._exit(0)
+        os._exit(RESTART)      # the supervisor opens the app window again
 
     def look_dialog():
         from tkinter import colorchooser
@@ -705,7 +812,8 @@ def app_mode():
             return "#00FF00"
         if s in ("off", "not watching", "not started"):
             return DIM
-        if any(s.startswith(x) for x in ("loading", "starting", "launching", "waiting", "window closed")):
+        if any(s.startswith(x) for x in ("loading", "starting", "launching", "waiting", "window closed",
+                                         "teleporting", "already open")):
             return "#FFFF00"
         return "#FF4040"
 
@@ -721,15 +829,21 @@ def app_mode():
         s = store.settings
         game = "bee swarm" if s["place"] == core.BEE_SWARM else f"place {s['place']}"
         set_text("info", f"{game} | {'private server' if s.get('ps_raw') else 'public'} | {len(s['hb_dirs'])} hb folder(s)"
-                         + (f" | mouse locked ({s.get('mouse_key')} to free)" if mlock.locked else ""))
+                         + (f" | mouse locked ({s.get('mouse_key')} to free)" if mlock.locked else "")
+                         + (" | ROBLOX WAS ALREADY OPEN: only 1 window works, close roblox + stop/start"
+                            if on and not watcher.multi_ok else "")
+                         + (" | roblox is updating..." if on and watcher.updating else "")
+                         + (f" | {len(watcher.hidden)} window(s) hidden" if watcher.hidden else ""))
         for a in store.accounts:
             tag = rows.get(a["uid"])
             if tag is None:
                 continue
             t = watcher.status.get(a["uid"], "not started")
-            if not a.get("enabled", True):
+            if a.get("relogin"):
+                t = "log in again (add this account again)"
+            elif not a.get("enabled", True):
                 t = "off"
-            elif not on and not t.startswith("login expired"):
+            elif not on and not t.startswith(("login expired", "log in again")):
                 t = "not watching"
             r = watcher.restarts.get(a["uid"], 0)
             t2 = f"{t} ({r} restarts)" if r else t
@@ -791,9 +905,15 @@ def app_mode():
     root.after(300, fit_bg)
 
     def tick():
+        if os.path.exists(show_flag):       # the app was opened again: show this copy instead
+            try:
+                os.remove(show_flag)
+            except OSError:
+                pass
+            restore()
         if root.state() == "normal":        # minimized / in the tray: nothing to draw
             refresh()
-        root.after(1000, tick)
+        root.after(1500, tick)
 
     # ---------------- tray
     tray = {"icon": None}
@@ -801,6 +921,12 @@ def app_mode():
 
     def quit_app():
         mlock.unlock()
+        if watcher.hidden:
+            core.set_hidden([], False, watcher.hidden)    # never leave roblox windows invisible
+        try:
+            os.remove(running_flag)
+        except OSError:
+            pass
         if tray["icon"]:
             try:
                 tray["icon"].stop()
@@ -847,6 +973,13 @@ def app_mode():
     root.protocol("WM_DELETE_WINDOW", quit_app)     # always free the mouse when closing
     if store.settings.get("mouse_lock"):
         mlock.start(store.settings.get("mouse_key", "ctrl+alt+l"))
+    if store.settings.get("hide_on"):
+        hider.start(store.settings.get("hide_key", "ctrl+alt+h"))
+    if store.settings.get("win_start"):
+        try:
+            core.set_autorun(True)      # keeps pointing at this copy if the exe was moved
+        except OSError:
+            pass
 
     # ---------------- update check
     VERSION_FILE = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "version.txt")
@@ -871,15 +1004,58 @@ def app_mode():
     if store.settings.get("update_check", True):
         threading.Thread(target=check_updates, daemon=True).start()
 
-    log("ready. close all roblox windows before pressing start")
-    if store.settings.get("autostart") and store.accounts:
+    if not core.roblox_installed():
+        log("roblox doesn't look installed. install it from roblox.com (or bloxstrap / fishstrap) first")
+    if resume and os.path.exists(running_flag):
+        log("the app window crashed and was opened again, watching goes on")
         root.after(1500, toggle)
+    else:
+        log("ready. close all roblox windows before pressing start")
+        if store.settings.get("autostart") and store.accounts:
+            root.after(1500, toggle)
     tick()
     root.mainloop()
+
+
+# ------------------------------------------------------------------ supervisor
+RESTART = 5      # exit code: open the app window again (new look)
+_app_mutex = None
+
+
+def supervise():
+    """Only one copy at a time (opening it again shows the running one). The app window runs as a child
+    process that is opened again if it crashes: when Windows runs out of drawing memory Tk can kill its
+    whole process, and the watcher must not die with it."""
+    global _app_mutex
+    if core.IS_WIN:
+        import ctypes
+        _app_mutex = core._k.CreateMutexW(None, False, "Local\\NovaHopRejoinApp")
+        if ctypes.get_last_error() == 183:
+            try:
+                open(core._path("show.flag"), "w").close()
+            except OSError:
+                pass
+            return
+    cmd = [sys.executable] + ([] if getattr(sys, "frozen", False) else [os.path.abspath(__file__)]) + ["--child"]
+    crashes, resume = [], False
+    while True:
+        code = subprocess.run(cmd + (["--resume"] if resume else [])).returncode
+        if code == 0:
+            return
+        if code == RESTART:
+            resume = False
+            continue
+        crashes = [t for t in crashes if time.time() - t < 600] + [time.time()]
+        if len(crashes) > 5:          # crashing over and over: stop instead of looping forever
+            return
+        resume = True
+        time.sleep(3)
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--login":
         login_mode(sys.argv[2])
+    elif "--child" in sys.argv:
+        app_mode("--resume" in sys.argv)
     else:
-        app_mode()
+        supervise()
