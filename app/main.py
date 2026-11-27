@@ -776,19 +776,51 @@ def app_mode(resume=False):
         a["enabled"] = on
         store.save()
 
+    # ---------------- smooth rounded shapes: Tk can't smooth edges itself, so they are small pictures made with
+    # Pillow (drawn 4x bigger, then shrunk). Same size = same picture, so the whole screen uses only a handful.
+    CARD_W, CARD_H, GAP, BH = 300, 158, 10, 26
+    CARD_BG, CARD_LINE, BAR_BG, HOVER = "#0E0E0E", "#2A2A2A", "#262626", "#2E2E2E"
+    _imgs = {}
+
+    def rimg(w, h, r, fill, line=None):
+        key = (w, h, r, fill, line)
+        if key not in _imgs:
+            from PIL import Image, ImageDraw, ImageTk
+            im = Image.new("RGBA", (w * 4, h * 4), (0, 0, 0, 0))
+            ImageDraw.Draw(im).rounded_rectangle((0, 0, w * 4 - 1, h * 4 - 1), r * 4, fill=fill, outline=line,
+                                                 width=4 if line else 0)
+            _imgs[key] = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+        return _imgs[key]
+
+    def pill(x, y, label, tag, cmd, w=None, h=BH, small=False):
+        """a rounded button drawn on the canvas, lighter while the mouse is over it -> its width"""
+        f = FNT_S if small else FNT
+        w = w or f.measure(label) + 22
+        cv.create_image(x, y, anchor="nw", image=rimg(w, h, 7, BTN, CARD_LINE), tags=(tag, tag + "_bg", "pill"))
+        cv.create_text(x + w / 2, y + h / 2, text=label, font=f, fill=T["fg"] if cmd else DIM,
+                       tags=(tag, tag + "_t", "pill"))
+        if cmd:
+            cv.tag_bind(tag, "<Button-1>", lambda e: cmd(e))
+            cv.tag_bind(tag, "<Enter>", lambda e: (cv.itemconfigure(tag + "_bg", image=rimg(w, h, 7, HOVER, CARD_LINE)),
+                                                   cv.configure(cursor="hand2")))
+            cv.tag_bind(tag, "<Leave>", lambda e: (cv.itemconfigure(tag + "_bg", image=rimg(w, h, 7, BTN, CARD_LINE)),
+                                                   cv.configure(cursor="")))
+        return w
+
     def place_bar():
-        cv.delete("barwin")
-        cv.update_idletasks()
+        """the top buttons: the tk.Buttons only hold their text / command / state, the canvas draws them"""
+        cv.delete("bar")
         x = 12
-        for b in bar_btns:
-            cv.create_window(x, layout_y["bar"], window=b, anchor="nw", tags="barwin")
-            x += b.winfo_reqwidth() + 6
+        for i, b in enumerate(bar_btns):
+            on = b.cget("state") != "disabled"
+            x += pill(x, layout_y["bar"], b.cget("text"), f"bar{i}", (lambda e, b=b: b.invoke()) if on else None) + 6
+        cv.addtag_withtag("bar", "bar0")
+        for i in range(1, len(bar_btns)):
+            cv.addtag_withtag("bar", f"bar{i}")
 
     layout_y = {"bar": 12 + LH * 2 + 6}
 
     # ---------------- account cards: drawn straight onto the canvas (no extra windows per card, so it stays light)
-    CARD_W, CARD_H, GAP = 300, 158, 10
-    CARD_BG, CARD_LINE, BAR_BG = "#0E0E0E", "#2A2A2A", "#262626"
     FNT_B = tkfont.Font(family="Consolas", size=10, weight="bold")
     FNT_S = tkfont.Font(family="Consolas", size=9)
     card_seen = {}          # tag -> last value, so unchanged parts are never redrawn
@@ -815,17 +847,9 @@ def app_mode(resume=False):
             if c:
                 cv.coords(tag, c[0], c[1], max(c[0] + 1, x2), c[3])
 
-    def rrect(x1, y1, x2, y2, r, **kw):
-        p = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-             x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        return cv.create_polygon(p, smooth=True, **kw)
-
     def card_btn(x, y, w, label, tag, cmd):
-        rrect(x, y, x + w, y + 22, 6, fill=BTN, outline=CARD_LINE, tags=("card", tag))
-        cv.create_text(x + w / 2, y + 11, text=label, font=FNT_S, fill=T["fg"], tags=("card", tag, tag + "_t"))
-        cv.tag_bind(tag, "<Button-1>", lambda e: cmd(e))
-        cv.tag_bind(tag, "<Enter>", lambda e: cv.configure(cursor="hand2"))
-        cv.tag_bind(tag, "<Leave>", lambda e: cv.configure(cursor=""))
+        pill(x, y, label, tag, cmd, w=w, h=22, small=True)
+        cv.addtag_withtag("card", tag)
 
     def more(e, a):
         menu.delete(0, "end")
@@ -848,10 +872,15 @@ def app_mode(resume=False):
 
         def put():
             try:
-                if uid not in avatars:
-                    avatars[uid] = tk.PhotoImage(file=f)
+                if uid not in avatars:           # rounded corners, to match the cards
+                    from PIL import Image, ImageDraw, ImageTk
+                    im = Image.open(f).convert("RGBA").resize((48, 48), Image.LANCZOS)
+                    mask = Image.new("L", (192, 192), 0)
+                    ImageDraw.Draw(mask).rounded_rectangle((0, 0, 191, 191), 32, fill=255)
+                    im.putalpha(mask.resize((48, 48), Image.LANCZOS))
+                    avatars[uid] = ImageTk.PhotoImage(im)
                 cv.itemconfigure(tag, image=avatars[uid])
-            except tk.TclError:
+            except Exception:
                 pass
         if uid in avatars or os.path.exists(f):
             put()
@@ -875,8 +904,8 @@ def app_mode(resume=False):
 
     def draw_card(a, x, y):
         uid = a["uid"]
-        rrect(x, y, x + CARD_W, y + CARD_H, 10, fill=CARD_BG, outline=CARD_LINE, tags="card")
-        cv.create_rectangle(x + 10, y + 10, x + 58, y + 58, fill=BAR_BG, outline="", tags="card")
+        cv.create_image(x, y, anchor="nw", image=rimg(CARD_W, CARD_H, 12, CARD_BG, CARD_LINE), tags="card")
+        cv.create_image(x + 10, y + 10, anchor="nw", image=rimg(48, 48, 8, BAR_BG), tags="card")
         cv.create_image(x + 10, y + 10, anchor="nw", tags=("card", "av_" + uid))
         load_avatar(uid, "av_" + uid)
         nm = "nm_" + uid
@@ -893,7 +922,7 @@ def app_mode(resume=False):
         n = perf_count()
         for t in ([size] if size != "normal" else []) + ([f"+{n} from performance"] if n else []):
             w = FNT_S.measure(t) + 12
-            rrect(tx, y + 50, tx + w, y + 66, 6, fill=BAR_BG, outline="", tags="card")
+            cv.create_image(tx, y + 50, anchor="nw", image=rimg(w, 17, 7, BAR_BG), tags="card")
             cv.create_text(tx + 6, y + 58, text=t, anchor="w", font=FNT_S, fill=T["fg"], tags="card")
             tx += w + 6
         cv.create_text(x + 10, y + 74, text="", anchor="nw", font=FNT_S, tags=("card", "st_" + uid))
@@ -911,7 +940,7 @@ def app_mode(resume=False):
     def layout():
         """(re)draw everything except the background"""
         cv.delete("txt")
-        cv.delete("rowwin")
+        cv.delete("rowpill")
         cv.delete("card")
         drawn.clear()
         card_seen.clear()
@@ -923,14 +952,14 @@ def app_mode(resume=False):
         text(x0, 10, "status: stopped", T["fg"], "status")
         text(x0, 10 + LH, "", DIM, "info")
         place_bar()
-        bh = start_btn.winfo_reqheight()
+        bh = BH
         y = layout_y["bar"] + bh + 14
 
         def rbtn(t, cmd, x, yy):
-            b = btn(cv, t, cmd)
-            row_widgets.append(b)
-            cv.create_window(x, yy, window=b, anchor="nw", tags="rowwin")
-            return x + b.winfo_reqwidth() + 4
+            tag = "row_" + t.replace(" ", "_")
+            w = pill(x, yy, t, tag, lambda e: cmd())
+            cv.addtag_withtag("rowpill", tag)
+            return x + w + 6
 
         text(x0, y + 4, "accounts:", T["fg"], "acc_h")
         x = x0 + FNT.measure("accounts: ") + 6
@@ -987,6 +1016,7 @@ def app_mode(resume=False):
         set_text("status", "status: running" if on else "status: stopped")
         if start_btn.cget("text") != ("Stop" if on else "Start"):
             start_btn.configure(text="Stop" if on else "Start")
+            place_bar()
         game = "bee swarm" if s["place"] == core.BEE_SWARM else f"place {s['place']}"
         set_text("info", f"{game} | {'private server' if s.get('ps_raw') else 'public'} | {len(s['hb_dirs'])} hb folder(s)"
                          + (f" | mouse locked ({s.get('mouse_key')} to free)" if mlock.locked else "")
