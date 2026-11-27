@@ -131,7 +131,7 @@ def app_mode(resume=False):
 
     root = tk.Tk()
     root.title("NovaHop Rejoin")
-    root.geometry("760x640")
+    root.geometry("960x720")
     root.configure(bg=BG)
     root.report_callback_exception = lambda kind, val, tb: log(f"screen problem (watching goes on): {val!r}")
 
@@ -457,7 +457,6 @@ def app_mode(resume=False):
                    check("keep window on top", "on_top"),
                    check("minimize to the tray (next to the clock)", "tray"),
                    check("open roblox windows minimized (they won't steal focus)", "launch_min"),
-                   check("make roblox windows small (640x400, less ram & gpu)", "shrink"),
                    check("also read roblox's own logs (catches kicks / disconnects without the executor)", "read_logs"),
                    check("check for updates when the app opens", "update_check")]
         lbl(d, "text colour").pack(anchor="w", padx=10, pady=(4, 0))
@@ -537,6 +536,17 @@ def app_mode(resume=False):
         rt = entry("free up roblox ram every (minutes)", s.get("ram_trim", 0))
         rl = entry("restart an account using more ram than (MB, e.g. 2500)", s.get("ram_limit", 0))
         cc = entry("cpu limit per roblox window (% of the whole cpu, e.g. 10)", s.get("cpu_cap", 0))
+        srow = tk.Frame(d, bg=BG)
+        srow.pack(anchor="w", padx=10, pady=(6, 0))
+        lbl(srow, "roblox window size: ").pack(side="left")
+        SIZE_NAMES = {"normal": "normal", "small": "small (640x400)", "micro": "micro (320x200)"}
+        size_var = tk.StringVar(value=SIZE_NAMES.get(s.get("win_size", "normal"), "normal"))
+        sm = tk.OptionMenu(srow, size_var, *SIZE_NAMES.values())
+        sm.configure(bg=BTN, fg=T["fg"], activebackground="#333333", activeforeground=T["fg"], relief="solid", bd=1,
+                     font=FONT, highlightthickness=0)
+        sm["menu"].configure(bg=BTN, fg="#FFFFFF", font=FONT)
+        sm.pack(side="left")
+        lbl(d, "(smaller = less graphics work. micro gets past roblox's minimum size)", fg=DIM).pack(anchor="w", padx=10)
         low_was = bool(s.get("low_gfx"))
         checks += [check("lowest graphics: no grass, low textures, gray sky (less ram & gpu)", "low_gfx"),
                    check("efficiency mode: roblox windows get low priority so your pc stays smooth", "eco")]
@@ -566,7 +576,8 @@ def app_mode(resume=False):
                 messagebox.showerror("NovaHop Rejoin", "the two hotkeys have to be different, nothing saved", parent=win)
                 return
             fps_changed = new["fps_cap"] != int(s.get("fps_cap", 0))
-            new.update(webhook=url, wh_ping=ping.get().strip(), mouse_key=key, hide_key=hkey)
+            new.update(webhook=url, wh_ping=ping.get().strip(), mouse_key=key, hide_key=hkey,
+                       win_size=next(k for k, v in SIZE_NAMES.items() if v == size_var.get()))
             for k, v in checks:
                 new[k] = bool(v.get())
             if new["win_start"] != bool(s.get("win_start")):
@@ -761,8 +772,8 @@ def app_mode(resume=False):
             d.destroy()
         btn(d, "Save", save).pack(anchor="w", padx=10, pady=10)
 
-    def set_enabled(a, var):
-        a["enabled"] = bool(var.get())
+    def set_enabled(a, on):
+        a["enabled"] = on
         store.save()
 
     def place_bar():
@@ -775,11 +786,135 @@ def app_mode(resume=False):
 
     layout_y = {"bar": 12 + LH * 2 + 6}
 
+    # ---------------- account cards: drawn straight onto the canvas (no extra windows per card, so it stays light)
+    CARD_W, CARD_H, GAP = 300, 158, 10
+    CARD_BG, CARD_LINE, BAR_BG = "#0E0E0E", "#2A2A2A", "#262626"
+    FNT_B = tkfont.Font(family="Consolas", size=10, weight="bold")
+    FNT_S = tkfont.Font(family="Consolas", size=9)
+    card_seen = {}          # tag -> last value, so unchanged parts are never redrawn
+    avatars = {}            # uid -> PhotoImage (made once)
+    PERF = ("fps_cap", "low_gfx", "eco", "ram_trim", "cpu_cap")
+    menu = tk.Menu(root, tearoff=0, bg=BTN, fg="#FFFFFF", activebackground=DIM, font=FONT)
+
+    def columns():
+        return max(1, (max(cv.winfo_width(), root.winfo_width()) - 24 + GAP) // (CARD_W + GAP))
+
+    def perf_count():
+        return sum(1 for k in PERF if store.settings.get(k))
+
+    def cset(tag, **kw):
+        if card_seen.get(tag) != kw:
+            card_seen[tag] = kw
+            cv.itemconfigure(tag, **kw)
+
+    def bar(tag, x, frac):
+        x2 = x + max(0, min(1.0, frac)) * 60
+        if card_seen.get(tag) != x2:
+            card_seen[tag] = x2
+            c = cv.coords(tag)
+            if c:
+                cv.coords(tag, c[0], c[1], max(c[0] + 1, x2), c[3])
+
+    def rrect(x1, y1, x2, y2, r, **kw):
+        p = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+             x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return cv.create_polygon(p, smooth=True, **kw)
+
+    def card_btn(x, y, w, label, tag, cmd):
+        rrect(x, y, x + w, y + 22, 6, fill=BTN, outline=CARD_LINE, tags=("card", tag))
+        cv.create_text(x + w / 2, y + 11, text=label, font=FNT_S, fill=T["fg"], tags=("card", tag, tag + "_t"))
+        cv.tag_bind(tag, "<Button-1>", lambda e: cmd(e))
+        cv.tag_bind(tag, "<Enter>", lambda e: cv.configure(cursor="hand2"))
+        cv.tag_bind(tag, "<Leave>", lambda e: cv.configure(cursor=""))
+
+    def more(e, a):
+        menu.delete(0, "end")
+        menu.add_command(label="launch", command=lambda: watcher.launch_now(a["uid"]))
+        menu.add_command(label="server", command=lambda: server_dialog(a))
+        menu.add_command(label="close", command=lambda: watcher.close(a["uid"]))
+        menu.add_command(label="rename", command=lambda: rename(a))
+        menu.add_separator()
+        menu.add_command(label="remove", command=lambda: remove(a))
+        menu.tk_popup(e.x_root, e.y_root)
+
+    def min_or_restore(a):
+        if watcher.minimized.get(a["uid"]):
+            watcher.show(a["uid"], front=False)
+        else:
+            watcher.minimize(a["uid"])
+
+    def load_avatar(uid, tag):
+        f = os.path.join(core.DATA_DIR, "avatars", uid + ".png")
+
+        def put():
+            try:
+                if uid not in avatars:
+                    avatars[uid] = tk.PhotoImage(file=f)
+                cv.itemconfigure(tag, image=avatars[uid])
+            except tk.TclError:
+                pass
+        if uid in avatars or os.path.exists(f):
+            put()
+            return
+
+        def fetch():          # roblox's public headshot picture, saved so it's only downloaded once
+            try:
+                import urllib.request
+                u = f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={uid}&size=48x48&format=Png"
+                with urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": core.UA}), timeout=10) as r:
+                    img = json.load(r)["data"][0]["imageUrl"]
+                with urllib.request.urlopen(urllib.request.Request(img, headers={"User-Agent": core.UA}), timeout=10) as r:
+                    data = r.read()
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                with open(f, "wb") as fh:
+                    fh.write(data)
+                root.after(0, put)
+            except Exception:
+                pass
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def draw_card(a, x, y):
+        uid = a["uid"]
+        rrect(x, y, x + CARD_W, y + CARD_H, 10, fill=CARD_BG, outline=CARD_LINE, tags="card")
+        cv.create_rectangle(x + 10, y + 10, x + 58, y + 58, fill=BAR_BG, outline="", tags="card")
+        cv.create_image(x + 10, y + 10, anchor="nw", tags=("card", "av_" + uid))
+        load_avatar(uid, "av_" + uid)
+        nm = "nm_" + uid
+        cv.create_text(x + 68, y + 12, text=a.get("nick") or a["name"], anchor="nw", font=FNT_B, fill=T["fg"],
+                       tags=("card", nm))
+        cv.tag_bind(nm, "<Double-Button-1>", lambda e: rename(a))
+        cv.create_text(x + 68, y + 32, text="", anchor="nw", font=FNT_S, fill=DIM, tags=("card", "sub_" + uid))
+        en = "en_" + uid
+        cv.create_text(x + CARD_W - 10, y + 12, text="", anchor="ne", font=FNT_S, tags=("card", en))
+        cv.tag_bind(en, "<Button-1>", lambda e: set_enabled(a, not a.get("enabled", True)))
+        # tags: window size + how many performance settings are on
+        tx = x + 68
+        size = store.settings.get("win_size", "normal")
+        n = perf_count()
+        for t in ([size] if size != "normal" else []) + ([f"+{n} from performance"] if n else []):
+            w = FNT_S.measure(t) + 12
+            rrect(tx, y + 50, tx + w, y + 66, 6, fill=BAR_BG, outline="", tags="card")
+            cv.create_text(tx + 6, y + 58, text=t, anchor="w", font=FNT_S, fill=T["fg"], tags="card")
+            tx += w + 6
+        cv.create_text(x + 10, y + 74, text="", anchor="nw", font=FNT_S, tags=("card", "st_" + uid))
+        for label, bx, key in (("cpu", x + 10, "cpu"), ("ram", x + 152, "mem")):
+            cv.create_text(bx, y + 104, text=label, anchor="w", font=FNT_S, fill=DIM, tags="card")
+            cv.create_rectangle(bx + 30, y + 102, bx + 90, y + 107, fill=BAR_BG, outline="", tags="card")
+            cv.create_rectangle(bx + 30, y + 102, bx + 31, y + 107, fill=T["fg"], outline="",
+                                tags=("card", f"{key}bar_{uid}"))
+            cv.create_text(bx + 96, y + 104, text="", anchor="w", font=FNT_S, fill=T["fg"],
+                           tags=("card", f"{key}_{uid}"))
+        card_btn(x + 10, y + 124, 80, "show", "bshow_" + uid, lambda e: watcher.show(uid))
+        card_btn(x + 96, y + 124, 90, "minimize", "bmin_" + uid, lambda e: min_or_restore(a))
+        card_btn(x + CARD_W - 40, y + 124, 30, "...", "bmore_" + uid, lambda e: more(e, a))
+
     def layout():
         """(re)draw everything except the background"""
         cv.delete("txt")
         cv.delete("rowwin")
+        cv.delete("card")
         drawn.clear()
+        card_seen.clear()
         for w in row_widgets:
             w.destroy()
         row_widgets.clear()
@@ -801,30 +936,18 @@ def app_mode(resume=False):
         x = x0 + FNT.measure("accounts: ") + 6
         x = rbtn("Launch all", watcher.launch_all, x, y)
         rbtn("Close all", close_all, x, y)
-        y += bh + 8
+        y += bh + 10
         if not store.accounts:
             text(x0, y, "no accounts", DIM, "noacc")
             y += LH + 6
-        for a in store.accounts:
-            var = tk.IntVar(value=1 if a.get("enabled", True) else 0)
-            cb = tk.Checkbutton(cv, variable=var, bg=BTN, activebackground=BTN, selectcolor=BG, fg=T["fg"],
-                                bd=0, highlightthickness=0, command=lambda a=a, v=var: set_enabled(a, v))
-            cb.var = var
-            row_widgets.append(cb)
-            cv.create_window(x0, y + 2, window=cb, anchor="nw", tags="rowwin")
-            tag = "nm_" + a["uid"]
-            text(x0 + 28, y + 4, a.get("nick") or a["name"], T["fg"], tag)
-            cv.tag_bind(tag, "<Double-Button-1>", lambda e, a=a: rename(a))
-            text(x0 + 28 + CW * 18, y + 4, "", DIM, "st_" + a["uid"])
-            rows[a["uid"]] = "st_" + a["uid"]
-            x = x0 + 28 + CW * 50
-            x = rbtn("Launch", lambda u=a["uid"]: watcher.launch_now(u), x, y)
-            x = rbtn("Server", lambda a=a: server_dialog(a), x, y)
-            x = rbtn("Close", lambda u=a["uid"]: watcher.close(u), x, y)
-            rbtn("x", lambda a=a: remove(a), x, y)
-            y += bh + 4
+        cols = columns()
+        for i, a in enumerate(store.accounts):
+            draw_card(a, x0 + (i % cols) * (CARD_W + GAP), y + (i // cols) * (CARD_H + GAP))
+            rows[a["uid"]] = True
+        if store.accounts:
+            y += ((len(store.accounts) + cols - 1) // cols) * (CARD_H + GAP)
         if store.settings.get("show_log", True):
-            y += 10
+            y += 6
             text(x0, y + 4, "log:", T["fg"], "log_h")
             rbtn("clear", clear_log, x0 + FNT.measure("log: ") + 6, y)
             y += bh + 6
@@ -855,14 +978,15 @@ def app_mode(resume=False):
 
     def refresh():
         on = watcher.alive
-        key = ",".join(a["uid"] for a in store.accounts) + "|" + T["fg"]
+        s = store.settings
+        key = "|".join([",".join(a["uid"] for a in store.accounts), T["fg"], str(columns()),
+                        s.get("win_size", "normal"), str(perf_count())])
         if key != rows_key[0]:
             rows_key[0] = key
             layout()
         set_text("status", "status: running" if on else "status: stopped")
         if start_btn.cget("text") != ("Stop" if on else "Start"):
             start_btn.configure(text="Stop" if on else "Start")
-        s = store.settings
         game = "bee swarm" if s["place"] == core.BEE_SWARM else f"place {s['place']}"
         set_text("info", f"{game} | {'private server' if s.get('ps_raw') else 'public'} | {len(s['hb_dirs'])} hb folder(s)"
                          + (f" | mouse locked ({s.get('mouse_key')} to free)" if mlock.locked else "")
@@ -870,21 +994,33 @@ def app_mode(resume=False):
                             if on and not watcher.multi_ok else "")
                          + (" | roblox is updating..." if on and watcher.updating else "")
                          + (f" | {len(watcher.hidden)} window(s) hidden" if watcher.hidden else ""))
+        limit = int(s.get("ram_limit", 0)) or 3000
         for a in store.accounts:
-            tag = rows.get(a["uid"])
-            if tag is None:
+            uid = a["uid"]
+            if uid not in rows:
                 continue
-            t = watcher.status.get(a["uid"], "not started")
+            t = watcher.status.get(uid, "not started")
             if a.get("relogin"):
                 t = "log in again (add this account again)"
             elif not a.get("enabled", True):
                 t = "off"
             elif not on and not t.startswith(("login expired", "log in again")):
                 t = "not watching"
-            r = watcher.restarts.get(a["uid"], 0)
-            t2 = f"{t} ({r} restarts)" if r else t
-            mb = watcher.ram.get(a["uid"]) if on else None
-            set_text(tag, f"{t2} | {mb} MB" if mb else t2, color(t))
+            r = watcher.restarts.get(uid, 0)
+            cset("st_" + uid, text=(f"{t} | {r} restarts" if r else t)[:44], fill=color(t))
+            last = watcher.last.get(uid)
+            up = f" · {core._ago(time.time() - last)}" if on and t == "OK" and last else ""
+            game_ = core.game_name(core.server_for(a, s)[0]).lower()
+            cset("sub_" + uid, text=(game_[:24] + up))
+            en = a.get("enabled", True)
+            cset("en_" + uid, text="[on]" if en else "[off]", fill="#00FF00" if en else DIM)
+            cpu = watcher.cpu.get(uid) if on else None
+            mb = watcher.ram.get(uid) if on else None
+            cset(f"cpu_{uid}", text=f"{cpu:.0f}%" if cpu is not None else "-")
+            cset(f"mem_{uid}", text=(f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb} MB") if mb else "-")
+            bar(f"cpubar_{uid}", cv.coords(f"cpubar_{uid}")[0] if cv.coords(f"cpubar_{uid}") else 0, (cpu or 0) / 100 * 5)
+            bar(f"membar_{uid}", cv.coords(f"membar_{uid}")[0] if cv.coords(f"membar_{uid}") else 0, (mb or 0) / limit)
+            cset("bmin_" + uid + "_t", text="restore" if watcher.minimized.get(uid) else "minimize")
         with lock:
             new = [t for n, t in lines if n > shown[0]]
             shown[0] = count[0]
