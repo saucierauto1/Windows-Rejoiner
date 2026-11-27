@@ -16,17 +16,47 @@ jobs:
       - run: pip install -r requirements.txt pyinstaller==6.11.1
       - name: Check the code loads
         run: python -c "import sys; sys.path.insert(0, 'app'); import core, main, webview, psutil, PIL, pystray; print('ok')"
-      - name: Save the version number
+      - name: Save the version number and the exe's version info
         shell: bash
-        run: echo "${{ github.run_number }}" > app/version.txt
-      - name: Build NovaHopRejoin.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name NovaHopRejoin --icon app/icon.ico --add-data "app/icon.ico;." --add-data "app/version.txt;." --hidden-import pystray._win32 --hidden-import PIL.ImageTk --hidden-import PIL.ImageGrab --collect-all webview app/main.py
+        run: |
+          echo "${{ github.run_number }}" > app/version.txt
+          N=${{ github.run_number }}
+          cat > version_info.txt <<EOF
+          VSVersionInfo(
+            ffi=FixedFileInfo(filevers=(1, 0, $N, 0), prodvers=(1, 0, $N, 0), mask=0x3f, flags=0x0, OS=0x40004,
+                              fileType=0x1, subtype=0x0, date=(0, 0)),
+            kids=[StringFileInfo([StringTable('040904B0', [
+                    StringStruct('CompanyName', 'saucierauto1'),
+                    StringStruct('FileDescription', 'NovaHop Rejoin - keeps Roblox accounts in game'),
+                    StringStruct('FileVersion', '1.0.$N'),
+                    StringStruct('InternalName', 'NovaHopRejoin'),
+                    StringStruct('LegalCopyright', 'saucierauto1'),
+                    StringStruct('OriginalFilename', 'NovaHopRejoin.exe'),
+                    StringStruct('ProductName', 'NovaHop Rejoin'),
+                    StringStruct('ProductVersion', '1.0.$N')])]),
+                  VarFileInfo([VarStruct('Translation', [1033, 1200])])])
+          EOF
+      - name: Build NovaHopRejoin.exe (one file) and the folder version
+        shell: bash
+        run: |
+          OPTS='--noconfirm --windowed --noupx --name NovaHopRejoin --icon app/icon.ico --version-file version_info.txt --add-data app/icon.ico;. --add-data app/version.txt;. --hidden-import pystray._win32 --hidden-import PIL.ImageTk --hidden-import PIL.ImageGrab --collect-all webview'
+          pyinstaller $OPTS --onefile app/main.py
+          pyinstaller $OPTS --onedir --distpath folder --workpath build_folder app/main.py
+          cd folder && 7z a -tzip ../dist/NovaHopRejoin-folder.zip NovaHopRejoin > /dev/null
       - uses: actions/upload-artifact@v4
         with:
           name: NovaHopRejoin
-          path: dist/NovaHopRejoin.exe
+          path: |
+            dist/NovaHopRejoin.exe
+            dist/NovaHopRejoin-folder.zip
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: win-v1.0.${{ github.run_number }}
           name: NovaHop Rejoin for Windows v1.0.${{ github.run_number }}
-          files: dist/NovaHopRejoin.exe
+          body: |
+            **NovaHopRejoin.exe** - one file, just run it.
+            **NovaHopRejoin-folder.zip** - same app as a folder. Antivirus flags this one far less often:
+            unzip it anywhere and run NovaHopRejoin.exe inside the folder.
+          files: |
+            dist/NovaHopRejoin.exe
+            dist/NovaHopRejoin-folder.zip
