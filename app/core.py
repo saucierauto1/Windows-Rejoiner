@@ -819,9 +819,12 @@ def roblox_processes():
 
 
 def roblox_updating():
-    """Roblox's installer/updater is running (it downloads a new version before a window opens)"""
-    for p in psutil.process_iter(["name"]):
-        if (p.info["name"] or "").lower() in ("robloxplayerinstaller.exe", "robloxplayerlauncher.exe"):
+    """Roblox's installer/updater has been running for over 30 s (it downloads a new version before a window
+    opens; a normal launch passes through the launcher in a few seconds)"""
+    now = time.time()
+    for p in psutil.process_iter(["name", "create_time"]):
+        if (p.info["name"] or "").lower() in ("robloxplayerinstaller.exe", "robloxplayerlauncher.exe") \
+                and now - (p.info["create_time"] or now) > 30:
             return True
     return False
 
@@ -918,6 +921,10 @@ class Watcher:
         self.last = {}        # uid -> time of last launch
         self.err_since = {}
         self.err_msg = {}     # uid -> the error text the timer started with
+        self.err_first = {}   # uid -> when this error spell began (hop errors can't push it back)
+        self.unknown = set()  # uids whose window can't be told apart from other windows (warned once)
+        self.restored = False
+        self.saved = None
         self.gone_since = {}
         self.fails = {}
         self.restarts = {}
@@ -1096,9 +1103,54 @@ class Watcher:
             self.cpu_warned &= live
             uids = {a["uid"] for a in self.store.accounts}
             for d in (self.ram, self.status, self.beats, self.last, self.fails, self.err_since, self.err_msg,
-                      self.gone_since, self.hold, self.ram_hits, self.reason):
+                      self.err_first, self.gone_since, self.hold, self.ram_hits, self.reason):
                 for u in [u for u in d if u not in uids]:
                     del d[u]
+
+    # which window is whose is kept in windows.json, so it survives the app window crashing / restarting
+    def _restore(self, procs):
+        self.restored = True
+        d = _load("windows.json", {})
+        live = {p[0]: p[2] for p in procs}
+        uids = {a["uid"] for a in self.store.accounts}
+        with self.lock:
+            for u, v in (d.get("pids") or {}).items():
+                try:
+                    pid, made = int(v[0]), float(v[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if u in uids and pid in live and abs(live[pid] - made) < 2 and pid not in self.pids.values():
+                    self.pids.setdefault(u, pid)
+                    if u in (d.get("last") or {}):
+                        self.last.setdefault(u, d["last"][u])
+            if not self.hidden:
+                self.hidden.extend(d.get("hidden") or [])
+
+    def _save_state(self, procs):
+        made = {p[0]: p[2] for p in procs}
+        with self.lock:
+            snap = {"pids": {u: [p, made.get(p, 0)] for u, p in self.pids.items()},
+                    "last": dict(self.last), "hidden": list(self.hidden)}
+        if snap != self.saved:
+            self.saved = snap
+            try:
+                _save("windows.json", snap)
+            except OSError:
+                pass
+
+    def _cant_find(self, a, procs):
+        """the account needs a new window, but every window slot is taken by windows this app can't tell apart
+        (opened before the app, or by hand): closing a random one would hit another account"""
+        if not self.too_many_windows(procs):
+            return False
+        uid = a["uid"]
+        self.status[uid] = "can't tell which roblox window is this one: close the extra windows"
+        if uid not in self.unknown:
+            self.unknown.add(uid)
+            self.log(f"{a.get('nick') or a['name']} needs a restart, but there are already as many roblox windows "
+                     "as accounts and the app can't tell which one is its window. Close that window (or Close all) "
+                     "and it comes back by itself.")
+        return True
 
     def too_many_windows(self, procs):
         """never run more Roblox windows than there are enabled accounts (disabled accounts' windows don't count)"""
@@ -1169,6 +1221,7 @@ class Watcher:
             self.log(f"{a['name']}: not opening another Roblox, there are already {len(procs)} open "
                      "(close the extra ones, or use Launch to force it)")
             self.last[uid] = self.now()
+            self.err_since[uid] = 0
             return
         if s.get("fps_cap") or s.get("low_gfx"):
             self.apply_fps(quiet=True)      # a Roblox update puts it in a new folder without them
@@ -1382,6 +1435,8 @@ class Watcher:
         now = self.now()
         s = self.store.settings
         procs = self.procs()
+        if not self.restored:
+            self._restore(procs)
         self._adopt(procs)
         self._cleanup({p[0] for p in procs})
         err_wait = int(s.get("error_wait", ERROR_WAIT))
@@ -1422,6 +1477,7 @@ class Watcher:
             with self.lock:
                 pid = self.pids.get(uid)
             if pid:
+                self.unknown.discard(uid)
                 self.ram[uid] = self.mem(pid)
                 if self.last.get(uid) and now - self.last[uid] < 180:
                     self._tame(pid)
@@ -1476,6 +1532,8 @@ class Watcher:
                 if f >= 3 and now - last < RETRY:
                     self.status[uid] = "not coming back, retrying every 15 min"
                     continue
+                if self._cant_find(a, procs):
+                    continue
                 if f == 2:
                     self.notify("stuck", f"**{name}** keeps closing after 3 relaunches. Check that PC.")
                 self.fails[uid] = f + 1
@@ -1501,17 +1559,22 @@ class Watcher:
                 if not self.err_since.get(uid) or (err != self.err_msg.get(uid) and HOPPING.search(err)):
                     if not self.err_since.get(uid):
                         self.log(f"{name}: error on screen: {err}")
+                        self.err_first[uid] = now
                     self.err_since[uid] = now
                     self.err_msg[uid] = err
-                # a teleport / full-server error is NovaHop mid-hop and it retries by itself: give it longer
+                # a teleport / full-server error is NovaHop mid-hop and it retries by itself: give it longer,
+                # but never more than 5x that in one go (two hop errors taking turns forever = stuck)
                 wait = hop if HOPPING.search(err) else err_wait
-                if now - self.err_since[uid] >= wait:
+                if now - self.err_since[uid] >= wait or now - self.err_first.get(uid, now) >= 5 * hop:
+                    if pid is None and self._cant_find(a, procs):
+                        continue
                     self.restart(a, pid, err if from_log else f"error screen ({err})")
                 continue
             if self.err_since.get(uid):
                 self.log(f"{name}: error cleared")
             self.err_since[uid] = 0
             self.err_msg.pop(uid, None)
+            self.err_first.pop(uid, None)
 
             if hb is None or age >= stale:
                 if hopping:
@@ -1519,6 +1582,8 @@ class Watcher:
                     continue
                 if f >= 3 and last and now - last < RETRY:
                     self.status[uid] = "not coming back, retrying every 15 min"
+                    continue
+                if pid is None and self._cant_find(a, procs):
                     continue
                 if f == 2:
                     self.notify("stuck", f"**{name}** didn't come back after 3 restarts. Check that PC.")
@@ -1553,3 +1618,4 @@ class Watcher:
                 if a and a.get("enabled", True):
                     self.launch(a, item[1])
                 self.next_launch = now + max(5, int(s.get("launch_delay", 12)))
+        self._save_state(self.procs())
