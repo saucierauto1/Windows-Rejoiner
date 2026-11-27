@@ -1,4 +1,4 @@
-# NovaHop Rejoin for Windows
+﻿# NovaHop Rejoin for Windows
 
 Auto-rejoiner for Bee Swarm Simulator (Roblox) alts, made for NovaHop script users. Owner: Simon (saucierauto1).
 Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-Rejoin.
@@ -107,7 +107,7 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
 - Roblox's own Windows error boxes (class `#32770`, e.g. "Roblox" with Retry / Cancel after a failed launch, crash
   boxes; `error_boxes`): an account's own box = error, restarted after error_wait even while "loading"; a box nobody
   owns is a dead launch taking a window slot and is killed right away.
-- RAM: cards and Discord show the working set (`ram_in_use`, what Task Manager shows, drops after a trim); the RAM
+- RAM: cards and Discord show the private working set (`ram_in_use`, PROCESS_MEMORY_COUNTERS_EX2, Task Manager's "Memory" column without shared files, drops after a trim); the RAM
   limit and the memory throttle use commit (`ram_mb`). Memory throttle (`mem_throttle` MB, off by default,
   `throttle_cpu` %, like RoAlt's "throttle on high memory"): over it the window gets the throttle cpu limit
   (tightens the normal cpu_cap, never loosens it), lifted under 90 %; it frees nothing. With ram_trim on, each window
