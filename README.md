@@ -8,6 +8,10 @@ Several accounts at once, no clone setup.
 
 Get `NovaHopRejoin.exe` from the **Releases** page of this repo.
 Windows may say "Windows protected your PC": click **More info**, then **Run anyway**.
+If your antivirus deletes the exe, download `NovaHopRejoin-folder.zip` instead, unzip it anywhere and run
+`NovaHopRejoin.exe` inside the folder (antivirus flags the folder version far less often).
+
+If something goes wrong, Settings > **Open log folder** has the log of the last few days to send on Discord.
 
 ## Setup
 
