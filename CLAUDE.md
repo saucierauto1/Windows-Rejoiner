@@ -12,7 +12,10 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
 - Look: plain and basic, like a hobby project ("like I coded it myself"). Pure black background, white text fields,
   lowercase labels. The login window title must not mention NovaHop. No screenshot feature (antivirus flags it).
   The main screen is a grid of account cards (owner asked for "slightly similar" to RoAlt, without window
-  previews): keep the cards, in this black / lowercase / Consolas style.
+  previews): keep the cards, in this black / lowercase / Consolas style. Rounded shapes (cards, buttons, tags,
+  avatars) are smooth Pillow pictures (`rimg`, drawn 4x and shrunk, cached per size, so only a handful exist);
+  the top bar and row buttons are canvas pills (`pill`, lighter on hover) - the `bar_btns` tk.Buttons are never
+  shown, they only hold text / command / state.
 
 ## Build / release
 - Pushing to `main` runs `.github/workflows/build.yml` (windows-latest, Python 3.12, PyInstaller 6.11.1, `--noupx`,
