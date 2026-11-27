@@ -82,6 +82,9 @@ if IS_WIN:
     for _n, _r, _a in (("EnumWindows", wintypes.BOOL, [WNDENUMPROC, wintypes.LPARAM]),
                        ("GetWindowThreadProcessId", wintypes.DWORD, [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]),
                        ("IsWindowVisible", wintypes.BOOL, [wintypes.HWND]),
+                       ("IsIconic", wintypes.BOOL, [wintypes.HWND]),
+                       ("GetWindowRect", wintypes.BOOL, [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]),
+                       ("SetForegroundWindow", wintypes.BOOL, [wintypes.HWND]),
                        ("GetWindow", wintypes.HWND, [wintypes.HWND, ctypes.c_uint]),
                        ("ShowWindow", wintypes.BOOL, [wintypes.HWND, ctypes.c_int]),
                        ("SetWindowPos", wintypes.BOOL, [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
@@ -141,8 +144,9 @@ class Store:
                      ("mouse_lock", False), ("mouse_key", "ctrl+alt+l"),
                      ("boot_wait", BOOT_WAIT), ("fps_cap", 0), ("ram_trim", 0), ("ram_limit", 0), ("ax_dirs", []),
                      ("low_gfx", False), ("eco", False), ("cpu_cap", 0), ("flag_backup", {}), ("read_logs", False),
-                     ("win_start", False), ("shrink", False), ("hide_on", False), ("hide_key", "ctrl+alt+h")):
+                     ("win_start", False), ("hide_on", False), ("hide_key", "ctrl+alt+h")):
             self.settings.setdefault(k, v)
+        self.settings.setdefault("win_size", "small" if self.settings.pop("shrink", False) else "normal")
 
     def save(self):
         with self.lock:
@@ -854,13 +858,14 @@ def windows_of(pids, visible=True):
     return found
 
 
-SHRINK = (640, 400)
+SIZES = {"small": (640, 400), "micro": (320, 200)}
+_RESIZE = 0x2 | 0x4 | 0x10 | 0x400   # SWP_NOMOVE | NOZORDER | NOACTIVATE | NOSENDCHANGING (gets past Roblox's minimum size)
 
 
-def tame_window(pid, minimize=False, shrink=False):
-    """for the first minute of a new Roblox window: shrink and/or minimize every window it shows,
+def tame_window(pid, minimize=False, size=None):
+    """for the first minute of a new Roblox window: resize and/or minimize every window it shows,
     never activating it (Roblox shows its real window a few seconds after the splash)"""
-    if not IS_WIN or not (minimize or shrink):
+    if not IS_WIN or not (minimize or size):
         return
 
     def run():
@@ -870,12 +875,68 @@ def tame_window(pid, minimize=False, shrink=False):
                 if h in done:
                     continue
                 done.add(h)
-                if shrink:     # SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
-                    _u.SetWindowPos(h, None, 0, 0, SHRINK[0], SHRINK[1], 0x2 | 0x4 | 0x10)
+                if size:
+                    _u.SetWindowPos(h, None, 0, 0, size[0], size[1], _RESIZE)
                 if minimize:
                     _u.ShowWindow(h, 7)      # SW_SHOWMINNOACTIVE
             time.sleep(0.5)
     threading.Thread(target=run, daemon=True).start()
+
+
+def fit_window(pid, size):
+    """put a window Roblox grew back (e.g. after a teleport) to its size again; minimized ones are left alone"""
+    if not IS_WIN:
+        return
+    for h, _p in windows_of([pid]):
+        if _u.IsIconic(h):
+            continue
+        r = wintypes.RECT()
+        if _u.GetWindowRect(h, ctypes.byref(r)) and (abs(r.right - r.left - size[0]) > 8 or abs(r.bottom - r.top - size[1]) > 8):
+            _u.SetWindowPos(h, None, 0, 0, size[0], size[1], _RESIZE)
+
+
+def is_minimized(pid):
+    return IS_WIN and any(_u.IsIconic(h) for h, _p in windows_of([pid]))
+
+
+def show_window(pid, hidden, front=True):
+    """the card's Show (front=True: restore + bring to the front) / Restore (front=False: restore without focus).
+    Only ever called from a button click, so Roblox never jumps to the front by itself."""
+    if not IS_WIN:
+        return
+    for h in list(hidden):              # hidden with the hotkey: unhide this one
+        owner = wintypes.DWORD()
+        _u.GetWindowThreadProcessId(h, ctypes.byref(owner))
+        if owner.value == pid:
+            hidden.remove(h)
+            _u.ShowWindow(h, 4)
+    for h, _p in windows_of([pid]):
+        _u.ShowWindow(h, 9 if front else 4)          # SW_RESTORE / SW_SHOWNOACTIVATE
+        if front:
+            _u.SetForegroundWindow(h)
+
+
+def minimize_window(pid):
+    if IS_WIN:
+        for h, _p in windows_of([pid]):
+            _u.ShowWindow(h, 7)                      # SW_SHOWMINNOACTIVE
+
+
+_cpu_procs = {}
+
+
+def cpu_pct(pid):
+    """this window's share of the whole PC's CPU, in % (the first reading of a new window is 0)"""
+    try:
+        p = _cpu_procs.get(pid) or _cpu_procs.setdefault(pid, psutil.Process(pid))
+        return round(p.cpu_percent(None) / (psutil.cpu_count() or 1), 1)
+    except (psutil.Error, OSError):
+        return 0.0
+
+
+def forget_cpu(live):
+    for pid in [p for p in _cpu_procs if p not in live]:
+        del _cpu_procs[pid]
 
 
 def set_hidden(pids, hide, hidden):
@@ -959,6 +1020,11 @@ class Watcher:
         self.mem = ram_mb
         self.limit = limit_process
         self.is_updating = roblox_updating
+        self.cpu_of = cpu_pct
+        self.win_min = is_minimized
+        self.fit = fit_window
+        self.cpu = {}         # uid -> % of the whole CPU, for the cards
+        self.minimized = {}   # uid -> its window is minimized
         self.limited = {}     # pid -> (eco, cpu) already set on that window
         self.jobs = {}        # pid -> job object handle (cpu cap)
         self.ram = {}         # uid -> MB, for the UI
@@ -1111,8 +1177,9 @@ class Watcher:
                 del self.limited[pid]
             self.tamed &= live
             self.cpu_warned &= live
+            forget_cpu(live)
             uids = {a["uid"] for a in self.store.accounts}
-            for d in (self.ram, self.status, self.beats, self.last, self.fails, self.err_since, self.err_msg,
+            for d in (self.ram, self.cpu, self.minimized, self.status, self.beats, self.last, self.fails, self.err_since, self.err_msg,
                       self.err_first, self.gone_since, self.hold, self.ram_hits, self.reason):
                 for u in [u for u in d if u not in uids]:
                     del d[u]
@@ -1173,9 +1240,25 @@ class Watcher:
 
     def _tame(self, pid):
         s = self.store.settings
-        if pid not in self.tamed and (s.get("launch_min") or s.get("shrink")):
+        size = SIZES.get(s.get("win_size"))
+        if pid not in self.tamed and (s.get("launch_min") or size):
             self.tamed.add(pid)
-            tame_window(pid, bool(s.get("launch_min")), bool(s.get("shrink")))
+            tame_window(pid, bool(s.get("launch_min")), size)
+
+    # the card buttons (each runs in its own thread: window calls can take a moment)
+    def show(self, uid, front=True):
+        with self.lock:
+            pid = self.pids.get(uid)
+        if pid:
+            threading.Thread(target=show_window, args=(pid, self.hidden, front), daemon=True).start()
+            self.minimized[uid] = False
+
+    def minimize(self, uid):
+        with self.lock:
+            pid = self.pids.get(uid)
+        if pid:
+            threading.Thread(target=minimize_window, args=(pid,), daemon=True).start()
+            self.minimized[uid] = True
 
     def toggle_hidden(self):
         if self.hidden:
@@ -1489,6 +1572,8 @@ class Watcher:
             if pid:
                 self.unknown.discard(uid)
                 self.ram[uid] = self.mem(pid)
+                self.cpu[uid] = self.cpu_of(pid)
+                self.minimized[uid] = self.win_min(pid)
                 if self.last.get(uid) and now - self.last[uid] < 180:
                     self._tame(pid)
                 want = (bool(s.get("eco")), int(s.get("cpu_cap", 0)))
@@ -1500,10 +1585,14 @@ class Watcher:
                         self.log(f"{name}: windows or roblox refused the cpu limit on this window")
             else:
                 self.ram.pop(uid, None)
+                self.cpu.pop(uid, None)
+                self.minimized.pop(uid, None)
             hb = self.beats.get(uid)
             age = now - hb[0] if hb else None
             last = self.last.get(uid)
-            booting = last is not None and now - last < self.boot_wait()
+            # a fresh heartbeat written after this launch = it's in game, no need to sit out the whole loading time
+            loaded = hb is not None and last is not None and hb[0] > last and age < 20 and hb[1] != "error"
+            booting = last is not None and now - last < self.boot_wait() and not loaded
             f = self.fails.get(uid, 0)
             ev = events.get(uid)
             if ev and last and ev[1] < last - 5:
@@ -1604,6 +1693,9 @@ class Watcher:
             else:
                 self.fails[uid] = 0
                 self.status[uid] = "OK"
+                size = SIZES.get(s.get("win_size"))
+                if size and pid and not self.minimized.get(uid):
+                    self.fit(pid, size)            # Roblox can grow a window back after a teleport
                 limit = int(s.get("ram_limit", 0))
                 if limit > 0 and pid:
                     mb = self.ram.get(uid) or self.mem(pid)
