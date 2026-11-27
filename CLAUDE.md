@@ -104,6 +104,14 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
   focus, minimize = SW_SHOWMINNOACTIVE. CPU per account = psutil cpu_percent / cpu count ("% of the whole PC").
 - Loading: an account leaves "loading" as soon as a fresh ok heartbeat written after its launch arrives, instead of
   waiting out the whole boot_wait.
+- Roblox's own Windows error boxes (class `#32770`, e.g. "Roblox" with Retry / Cancel after a failed launch, crash
+  boxes; `error_boxes`): an account's own box = error, restarted after error_wait even while "loading"; a box nobody
+  owns is a dead launch taking a window slot and is killed right away.
+- RAM: cards and Discord show the working set (`ram_in_use`, what Task Manager shows, drops after a trim); the RAM
+  limit and the memory throttle use commit (`ram_mb`). Memory throttle (`mem_throttle` MB, off by default,
+  `throttle_cpu` %, like RoAlt's "throttle on high memory"): over it the window gets the throttle cpu limit
+  (tightens the normal cpu_cap, never loosens it), lifted under 90 %; it frees nothing. With ram_trim on, each window
+  is also trimmed once right after it finishes loading.
 
 ## Untested on real hardware
 Real Windows runs of: login, multi-instance launch, tray, mouse lock, hide hotkey, shrink, start with Windows,
