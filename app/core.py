@@ -642,6 +642,7 @@ class Watcher:
         self.limited = {}     # pid -> (eco, cpu) already set on that window
         self.jobs = {}        # pid -> job object handle (cpu cap)
         self.ram = {}         # uid -> MB, for the UI
+        self.ram_hits = {}    # uid -> ram limit restarts in a row
 
     # -------------------------------------------------- control
     def start(self):
@@ -779,6 +780,8 @@ class Watcher:
                      "(close the extra ones, or use Launch to force it)")
             self.last[uid] = self.now()
             return
+        if s.get("fps_cap") or s.get("low_gfx"):
+            apply_fps(int(s.get("fps_cap", 0)), s.get("ax_dirs", []), bool(s.get("low_gfx")))
         self.log(f"Launching {a['name']}: {why}")
         self.open(uri)
         self.last[uid] = self.now()
@@ -1043,8 +1046,17 @@ class Watcher:
                 limit = int(self.store.settings.get("ram_limit", 0))
                 if limit > 0 and pid:
                     mb = self.mem(pid)
-                    if mb > limit:
+                    h = self.ram_hits.get(uid, 0)
+                    if mb <= limit:
+                        if last is None or now - last >= RETRY:
+                            self.ram_hits.pop(uid, None)
+                    elif h < 3 or last is None or now - last >= RETRY:
+                        if h == 2:
+                            self.notify("stuck", f"**{a['name']}** keeps going over the ram limit ({limit} MB). Raise it in settings.")
+                        self.ram_hits[uid] = h + 1
                         self.restart(a, pid, f"using {mb} MB of ram (limit {limit})")
+                    else:
+                        self.status[uid] = "over the ram limit, retrying every 15 min"
 
         # launch one waiting account per slot, so Roblox isn't flooded
         if self.queue and now >= self.next_launch:
