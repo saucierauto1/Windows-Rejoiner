@@ -11,6 +11,8 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
 - Short answers. Owner is not a programmer: explain in plain words, no jargon.
 - Look: plain and basic, like a hobby project ("like I coded it myself"). Pure black background, white text fields,
   lowercase labels. The login window title must not mention NovaHop. No screenshot feature (antivirus flags it).
+  The main screen is a grid of account cards (owner asked for "slightly similar" to RoAlt, without window
+  previews): keep the cards, in this black / lowercase / Consolas style.
 
 ## Build / release
 - Pushing to `main` runs `.github/workflows/build.yml` (windows-latest, Python 3.12, PyInstaller 6.11.1, `--noupx`,
@@ -34,7 +36,13 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
   `Tcl_SetPanicProc` (`_exit_on_tk_panic`): log the message, exit code 3. Tested with a real `Tcl_Panic` on Tk 9.0.
   Exit code 0 = quit, 5 = reopen (new look). More than 5 crashes in 10 min = give up.
   The child: tkinter UI, main screen is one Canvas (text drawn onto the background picture with a 1 px shadow,
-  picture never bigger than the screen), buttons via create_window. Dialogs: game/server, folders, settings
+  picture never bigger than the screen), top bar buttons via create_window. Accounts are cards (300x158) drawn
+  with canvas items only (rounded polygons, text, `tag_bind` click areas, one shared `tk.Menu` for "..."), no real
+  widgets per card, to keep window/GDI handles low; avatar headshots are downloaded once to `avatars/<uid>.png`.
+  Each card: avatar, name (double-click = rename), game + uptime, [on]/[off], size tag + "+N from performance",
+  status + restarts, cpu / ram bars, show / minimize-restore / "..." (launch, server, close, rename, remove).
+  Only changed card parts are redrawn (`cset` / `bar`); the grid is rebuilt only when accounts, colour, column count,
+  window size or the performance count change. Dialogs: game/server, folders, settings
   (scrollable, all-or-nothing save, performance preset dropdown, export/import, open log folder), look,
   per-account server. Tray (pystray), update check. Log file `%APPDATA%\NovaHopRejoin\logs\rejoin-YYYY-MM-DD.txt`
   (4 days kept). `--login <file>` = pywebview login child process (reads .ROBLOSECURITY and the page's
@@ -86,11 +94,17 @@ Discord: https://discord.gg/brfJ2ZtegE. Android version: saucierauto1/Emulator-R
   priority + EcoQoS + very low memory priority), cpu_cap % (job object hard cap; tried once per window, job handles
   closed when the window closes). Flags are written again before every launch (a Roblox update makes a new
   folder); `flag_backup` remembers the user's own values, which are put back when a setting is turned off.
-  Other options: shrink (640x400), launch_min, hide hotkey (hide_on / hide_key), win_start, read_logs.
+  Other options: win_size normal / small 640x400 / micro 320x200 (old `shrink: true` migrates to small; resized
+  with SWP_NOSENDCHANGING to get past Roblox's minimum size, and `fit_window` puts it back each tick if Roblox grew
+  it, never touching minimized windows), launch_min, hide hotkey (hide_on / hide_key), win_start, read_logs.
+  Card buttons: show = SW_RESTORE + SetForegroundWindow (only from a click, never automatic), restore = without
+  focus, minimize = SW_SHOWMINNOACTIVE. CPU per account = psutil cpu_percent / cpu count ("% of the whole PC").
+- Loading: an account leaves "loading" as soon as a fresh ok heartbeat written after its launch arrives, instead of
+  waiting out the whole boot_wait.
 
 ## Untested on real hardware
 Real Windows runs of: login, multi-instance launch, tray, mouse lock, hide hotkey, shrink, start with Windows,
-the Roblox log formats (guessed), the update detection, Tk 8.6 (the build's Python 3.12; local tests ran Tk 9.0),
+the Roblox log formats (guessed), the update detection, micro size / show / minimize on real Roblox windows, Tk 8.6 (the build's Python 3.12; local tests ran Tk 9.0),
 and the performance settings with real Roblox (CPU cap may be blocked by Roblox's anti-cheat). Tested on a real PC
 with stand-ins: CPU cap, efficiency mode, RAM trim and RAM display on a dummy process; flag write + restore on real
 Roblox/Bloxstrap files; every dialog in the real Tk window; supervisor crash restart and single copy, also in a
